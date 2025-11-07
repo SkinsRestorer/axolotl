@@ -17,7 +17,7 @@
     "dotenv-flow": "^4.1.0",
     "hono": "^4.8.4",
     "tsx": "^4.20.3",
-    "undici": "^6.19.2",
+    "undici": "^7.0.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
