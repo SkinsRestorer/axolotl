@@ -49,7 +49,7 @@ app.doc("/openapi", {
     },
   ],
   servers: [
-    { url: `https://axolotl.example.com`, description: "Main Server" },
+    { url: `https://axolotl.skinsrestorer.net`, description: "Main Server" },
     { url: `http://localhost:${PORT}`, description: "Local Server" },
   ],
 });
