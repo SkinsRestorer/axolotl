@@ -10,41 +10,140 @@ const MAX_POLL_DURATION_MS = 5 * 60 * 1_000;
 const CAPE_CACHE_TTL_MS = 5 * 60 * 1_000;
 
 const jobStatusSchema = z.enum([
-  "queued",
-  "pending",
-  "generating",
-  "completed",
+  "unknown",
+  "waiting",
+  "active",
   "failed",
+  "completed",
 ]);
 
 const mineSkinErrorSchema = z.object({
+  code: z.string().optional(),
   message: z.string().optional(),
 });
 
-const mineSkinJobDetailsSchema = z.object({
-  id: z.string(),
-  status: jobStatusSchema,
+const mineSkinJobDetailsSchema = z
+  .object({
+    id: z.string(),
+    status: jobStatusSchema,
+    result: z.string().optional(),
+  })
+  .passthrough();
+
+const mineSkinValueAndSignatureSchema = z.object({
+  value: z.string(),
+  signature: z.string(),
 });
 
-const mineSkinSkinTextureSchema = z.object({
-  data: z.object({
-    value: z.string(),
-    signature: z.string(),
-  }),
+const mineSkinSkinHashesSchema = z.object({
+  skin: z.string(),
+  cape: z.string().optional(),
 });
 
-const mineSkinSkinSchema = z.object({
-  uuid: z.string(),
-  name: z.string().optional(),
-  texture: mineSkinSkinTextureSchema,
+const mineSkinSkinUrlsSchema = z.object({
+  skin: z.string(),
+  cape: z.string().optional(),
 });
 
-const mineSkinJobSuccessSchema = z.object({
-  success: z.literal(true),
-  job: mineSkinJobDetailsSchema,
-  skin: mineSkinSkinSchema,
-  errors: z.array(mineSkinErrorSchema).optional(),
-});
+const mineSkinSkinTextureSchema = z
+  .object({
+    data: mineSkinValueAndSignatureSchema,
+    hash: mineSkinSkinHashesSchema.optional(),
+    url: mineSkinSkinUrlsSchema.optional(),
+  })
+  .passthrough();
+
+const mineSkinGeneratorInfoSchema = z
+  .object({
+    version: z.string(),
+    timestamp: z.number(),
+    duration: z.number(),
+    account: z.string(),
+    server: z.string(),
+  })
+  .passthrough();
+
+const mineSkinSkinSchema = z
+  .object({
+    uuid: z.string(),
+    name: z.string().optional(),
+    visibility: z.enum(["public", "unlisted", "private"]),
+    variant: z.enum(["classic", "slim", "unknown"]),
+    texture: mineSkinSkinTextureSchema,
+    generator: mineSkinGeneratorInfoSchema,
+    views: z.number(),
+    duplicate: z.boolean(),
+  })
+  .passthrough();
+
+const mineSkinDelayInfoSchema = z
+  .object({
+    millis: z.number(),
+    seconds: z.number().optional(),
+  })
+  .passthrough();
+
+const mineSkinNextRequestSchema = z
+  .object({
+    absolute: z.number(),
+    relative: z.number(),
+  })
+  .passthrough();
+
+const mineSkinLimitInfoSchema = z
+  .object({
+    limit: z.number(),
+    remaining: z.number(),
+    reset: z.number().optional(),
+  })
+  .passthrough();
+
+const mineSkinRateLimitInfoSchema = z
+  .object({
+    next: mineSkinNextRequestSchema,
+    delay: mineSkinDelayInfoSchema,
+    limit: mineSkinLimitInfoSchema.optional(),
+  })
+  .passthrough();
+
+const mineSkinCreditsUsageSchema = z
+  .object({
+    used: z.number(),
+    remaining: z.number(),
+  })
+  .passthrough();
+
+const mineSkinMeteredUsageSchema = z
+  .object({
+    used: z.number(),
+  })
+  .passthrough();
+
+const mineSkinUsageInfoSchema = z
+  .object({
+    credits: mineSkinCreditsUsageSchema.optional(),
+    metered: mineSkinMeteredUsageSchema.optional(),
+  })
+  .passthrough();
+
+const mineSkinJobSuccessSchema = z
+  .object({
+    success: z.literal(true),
+    job: mineSkinJobDetailsSchema,
+    skin: mineSkinSkinSchema,
+    rateLimit: mineSkinRateLimitInfoSchema.optional(),
+    usage: mineSkinUsageInfoSchema.optional(),
+    errors: z.array(mineSkinErrorSchema).optional(),
+    warnings: z.array(mineSkinErrorSchema).optional(),
+    messages: z.array(mineSkinErrorSchema).optional(),
+    links: z
+      .object({
+        self: z.string().url().optional(),
+      })
+      .catchall(z.unknown())
+      .optional(),
+  })
+  .passthrough();
 
 const mineSkinCapeSchema = z.object({
   uuid: z.string(),
@@ -57,38 +156,37 @@ type MineSkinJobDetails = z.infer<typeof mineSkinJobDetailsSchema>;
 type MineSkinJobSuccessResponse = z.infer<typeof mineSkinJobSuccessSchema>;
 type MineSkinCape = z.infer<typeof mineSkinCapeSchema>;
 
-type MineSkinEnqueueResponse =
-  | {
-      success: true;
-      job: MineSkinJobDetails;
-      errors?: MineSkinError[];
-    }
-  | {
-      success: false;
-      job?: MineSkinJobDetails;
-      errors?: MineSkinError[];
-    };
+type MineSkinRateLimitInfo = z.infer<typeof mineSkinRateLimitInfoSchema>;
+type MineSkinUsageInfo = z.infer<typeof mineSkinUsageInfoSchema>;
+
+type MineSkinGenericResponse = {
+  success?: boolean | undefined;
+  errors?: MineSkinError[] | undefined;
+  warnings?: MineSkinError[] | undefined;
+  messages?: MineSkinError[] | undefined;
+  rateLimit?: MineSkinRateLimitInfo | undefined;
+  usage?: MineSkinUsageInfo | undefined;
+};
+
+type MineSkinEnqueueResponse = MineSkinGenericResponse & {
+  job?: MineSkinJobDetails;
+  skin?: MineSkinJobSuccessResponse["skin"];
+};
 
 type MineSkinJobResponse =
   | MineSkinJobSuccessResponse
-  | {
-      success: false;
+  | (MineSkinGenericResponse & {
       job?: MineSkinJobDetails;
       skin?: MineSkinJobSuccessResponse["skin"];
-      errors?: MineSkinError[];
-    };
+    });
 
-type MineSkinCapeResponse = {
-  success?: boolean;
+type MineSkinCapeResponse = MineSkinGenericResponse & {
   capes?: (MineSkinCape & { supported?: boolean })[];
-  errors?: MineSkinError[];
 };
 
-type MineSkinMeResponse = {
-  success?: boolean;
-  user: string;
+type MineSkinMeResponse = MineSkinGenericResponse & {
+  user?: string;
   grants?: Record<string, unknown>;
-  errors?: MineSkinError[];
 };
 
 class ConfigurationError extends Error {
@@ -176,8 +274,17 @@ function normalizeStatus(
     : safeFallback;
 }
 
-function getMineSkinErrorMessage(errors?: MineSkinError[]): string {
-  return errors?.[0]?.message ?? "MineSkin request failed";
+function getFirstMineSkinMessage(items?: MineSkinError[]): string | undefined {
+  return items?.find((item) => item?.message)?.message;
+}
+
+function getMineSkinErrorMessage(response: MineSkinGenericResponse): string {
+  return (
+    getFirstMineSkinMessage(response.errors) ??
+    getFirstMineSkinMessage(response.warnings) ??
+    getFirstMineSkinMessage(response.messages) ??
+    "MineSkin request failed"
+  );
 }
 
 function ensureHttpsTextureUrl(url?: string | null): string | undefined {
@@ -216,7 +323,7 @@ async function requestMineSkinJob(
 
   if (!response.ok || data.success === false) {
     const status = response.ok ? 502 : response.status;
-    throw new UpstreamError(status, getMineSkinErrorMessage(data.errors));
+    throw new UpstreamError(status, getMineSkinErrorMessage(data));
   }
 
   try {
@@ -265,7 +372,7 @@ async function enqueueMineSkinJob(
 
   if (!response.ok || data.success === false || !data.job) {
     const status = response.ok ? 502 : response.status;
-    throw new UpstreamError(status, getMineSkinErrorMessage(data.errors));
+    throw new UpstreamError(status, getMineSkinErrorMessage(data));
   }
 
   try {
@@ -284,7 +391,7 @@ async function fetchMineSkinSupportedCapes(): Promise<MineSkinCape[]> {
 
   if (!response.ok || data.success === false) {
     const status = response.ok ? 502 : response.status;
-    throw new UpstreamError(status, getMineSkinErrorMessage(data.errors));
+    throw new UpstreamError(status, getMineSkinErrorMessage(data));
   }
 
   const capes = (data.capes ?? [])
@@ -311,7 +418,7 @@ async function fetchMineSkinCapeGrant(): Promise<boolean> {
 
   if (!response.ok || data.success === false) {
     const status = response.ok ? 502 : response.status;
-    throw new UpstreamError(status, getMineSkinErrorMessage(data.errors));
+    throw new UpstreamError(status, getMineSkinErrorMessage(data));
   }
 
   return Boolean(data.grants?.capes);
