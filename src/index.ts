@@ -6,6 +6,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { healthRouter } from "./routes/health";
+import { mineskinRouter } from "./routes/mineskin";
 
 const PORT = process.env.SERVER_PORT
   ? parseInt(process.env.SERVER_PORT, 10)
@@ -19,7 +20,7 @@ app.use(
   "*",
   cors({
     origin: "*",
-    allowMethods: ["GET"],
+    allowMethods: ["GET", "POST", "OPTIONS"],
     allowHeaders: ["*"],
     credentials: true,
   }),
@@ -39,7 +40,14 @@ app.doc("/openapi", {
     version: "1.0.0",
     description: "A lightweight health-check API",
   },
-  tags: [{ name: "health", description: "Health check endpoint" }],
+  tags: [
+    { name: "health", description: "Health check endpoint" },
+    {
+      name: "mineskin",
+      description:
+        "MineSkin proxy endpoints that inject the configured API key.",
+    },
+  ],
   servers: [
     { url: `https://axolotl.example.com`, description: "Main Server" },
     { url: `http://localhost:${PORT}`, description: "Local Server" },
@@ -51,6 +59,7 @@ app.get("/", (c) => {
 });
 
 app.route("/health", healthRouter);
+app.route("/mineskin", mineskinRouter);
 
 app.notFound((c) => {
   return c.json({ error: "Not Found" }, 404);
