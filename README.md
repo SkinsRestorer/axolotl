@@ -1,15 +1,19 @@
-# Elysia with Bun runtime
+# Axolotl
 
-## Getting Started
-To get started with this template, simply paste this command into your terminal:
-```bash
-bun create elysia ./elysia-example
-```
+Axolotl is a minimal Hono-based service that exposes a single health-check endpoint. It is designed to be lightweight and easy to deploy, providing a simple way to verify that the service is running.
 
 ## Development
-To start the development server run:
+
+Install dependencies with [pnpm](https://pnpm.io/):
+
 ```bash
-bun run dev
+pnpm install
 ```
 
-Open http://localhost:3000/ with your browser to see the result.
+Start the development server:
+
+```bash
+pnpm dev
+```
+
+Open http://localhost:3000/swagger to view the generated OpenAPI documentation.
