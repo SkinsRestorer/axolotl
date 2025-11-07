@@ -130,7 +130,7 @@ const mineSkinJobSuccessSchema = z
   .object({
     success: z.literal(true),
     job: mineSkinJobDetailsSchema,
-    skin: mineSkinSkinSchema,
+    skin: mineSkinSkinSchema.optional(),
     rateLimit: mineSkinRateLimitInfoSchema.optional(),
     usage: mineSkinUsageInfoSchema.optional(),
     errors: z.array(mineSkinErrorSchema).optional(),
@@ -344,6 +344,9 @@ async function pollMineSkinJob(
     const { status } = jobData.job;
 
     if (status === "completed") {
+      if (!jobData.skin) {
+        throw new UpstreamError(502, "MineSkin job completed but no skin data provided");
+      }
       return jobData;
     }
 
