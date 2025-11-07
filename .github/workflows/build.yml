@@ -15,25 +15,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
-        name: Install pnpm
-        with:
-          version: latest
-          run_install: false
-
-      - name: Install Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: 'pnpm'
+      - uses: oven-sh/setup-bun@v2
 
       - name: Install dependencies
-        run: pnpm install
+        run: bun install
 
       - name: Run typecheck
         run: |
-          pnpm typecheck
+          bun typecheck
 
       - name: Run check
         run: |
-          pnpm exec biome ci
+          bun run biome ci
