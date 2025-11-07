@@ -1,3 +1,9 @@
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+} from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { URL } from "node:url";
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
@@ -8,6 +14,62 @@ const MINESKIN_USER_AGENT = "Axolotl-MineSkin-Proxy/1.0";
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_DURATION_MS = 5 * 60 * 1_000;
 const CAPE_CACHE_TTL_MS = 5 * 60 * 1_000;
+
+function getAesSecretKey(): Buffer {
+  const key = process.env.AES_SECRET_KEY;
+  if (!key) {
+    throw new ConfigurationError(
+      "AES_SECRET_KEY environment variable is not set",
+    );
+  }
+  // Use SHA-256 to derive a 32-byte key
+  return createHash("sha256").update(key).digest();
+}
+
+function encryptUrl(url: string): string {
+  const key = getAesSecretKey();
+  const iv = randomBytes(16);
+  const cipher = createCipheriv("aes-256-cbc", key, iv);
+  let encrypted = cipher.update(url, "utf8", "base64");
+  encrypted += cipher.final("base64");
+  const combined = Buffer.concat([iv, Buffer.from(encrypted, "base64")]);
+  return `skinsrestorer-resolable://${combined.toString("base64")}`;
+}
+
+function decryptUrl(encryptedUrl: string): string {
+  if (!encryptedUrl.startsWith("skinsrestorer-resolable://")) {
+    throw new Error("Invalid encrypted URL format");
+  }
+  const key = getAesSecretKey();
+  const combined = Buffer.from(encryptedUrl.slice(25), "base64");
+  const iv = combined.subarray(0, 16);
+  const encrypted = combined.subarray(16);
+  const decipher = createDecipheriv("aes-256-cbc", key, iv);
+  let decrypted = decipher.update(encrypted);
+  decrypted = Buffer.concat([decrypted, decipher.final()]);
+  return decrypted.toString("utf8");
+}
+
+function encryptMineSkinUrls(obj: unknown): unknown {
+  if (typeof obj === "string") {
+    // Check if it's a URL (basic check)
+    if (obj.startsWith("http://") || obj.startsWith("https://")) {
+      return encryptUrl(obj);
+    }
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(encryptMineSkinUrls);
+  }
+  if (obj && typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      result[key] = encryptMineSkinUrls(value);
+    }
+    return result;
+  }
+  return obj;
+}
 
 const jobStatusSchema = z.enum([
   "unknown",
@@ -327,7 +389,8 @@ async function requestMineSkinJob(
   }
 
   try {
-    return mineSkinJobSuccessSchema.parse(data);
+    const parsed = mineSkinJobSuccessSchema.parse(data);
+    return encryptMineSkinUrls(parsed) as MineSkinJobSuccessResponse;
   } catch {
     throw new UpstreamError(502, "Unexpected MineSkin job response");
   }
@@ -345,7 +408,10 @@ async function pollMineSkinJob(
 
     if (status === "completed") {
       if (!jobData.skin) {
-        throw new UpstreamError(502, "MineSkin job completed but no skin data provided");
+        throw new UpstreamError(
+          502,
+          "MineSkin job completed but no skin data provided",
+        );
       }
       return jobData;
     }
@@ -406,7 +472,8 @@ async function fetchMineSkinSupportedCapes(): Promise<MineSkinCape[]> {
     }));
 
   try {
-    return z.array(mineSkinCapeSchema).parse(capes);
+    const parsed = z.array(mineSkinCapeSchema).parse(capes);
+    return encryptMineSkinUrls(parsed) as MineSkinCape[];
   } catch {
     throw new UpstreamError(502, "Unexpected MineSkin cape response");
   }
@@ -776,5 +843,57 @@ mineskinRouter.openapi(capeSupportRoute, async (c) => {
       return c.json({ error: error.message }, 502);
     }
     return c.json({ error: toErrorMessage(error) }, 502);
+  }
+});
+
+const decryptUrlRoute = createRoute({
+  method: "get",
+  path: "/decrypt-url",
+  tags: ["mineskin"],
+  description: "Decrypt an encrypted MineSkin URL back to the original URL.",
+  request: {
+    query: z.object({
+      encryptedUrl: z.string().describe("The encrypted URL to decrypt."),
+    }),
+  },
+  responses: {
+    200: {
+      description: "Decrypted URL.",
+      content: {
+        "application/json": {
+          schema: z.object({ url: z.string() }),
+        },
+      },
+    },
+    400: {
+      description: "Invalid encrypted URL.",
+      content: {
+        "application/json": {
+          schema: z.object({ error: z.string() }),
+        },
+      },
+    },
+    500: {
+      description: "Configuration error.",
+      content: {
+        "application/json": {
+          schema: z.object({ error: z.string() }),
+        },
+      },
+    },
+  },
+});
+
+mineskinRouter.openapi(decryptUrlRoute, async (c) => {
+  const { encryptedUrl } = c.req.valid("query");
+
+  try {
+    const decryptedUrl = decryptUrl(encryptedUrl);
+    return c.json({ url: decryptedUrl }, 200);
+  } catch (error) {
+    if (error instanceof ConfigurationError) {
+      return c.json({ error: error.message }, 500);
+    }
+    return c.json({ error: toErrorMessage(error) }, 400);
   }
 });
