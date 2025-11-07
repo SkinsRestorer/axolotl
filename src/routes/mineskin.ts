@@ -326,9 +326,12 @@ async function requestMineSkinJob(
     throw new UpstreamError(status, getMineSkinErrorMessage(data));
   }
 
+  console.log("MineSkin response data:", JSON.stringify(data, null, 2));
+
   try {
     return mineSkinJobSuccessSchema.parse(data);
-  } catch {
+  } catch (parseError) {
+    console.error("Parse error:", parseError);
     throw new UpstreamError(502, "Unexpected MineSkin job response");
   }
 }
