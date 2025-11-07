@@ -66,7 +66,7 @@ const mineSkinGeneratorInfoSchema = z
 const mineSkinSkinSchema = z
   .object({
     uuid: z.string(),
-    name: z.string().optional(),
+    name: z.string().nullable(),
     visibility: z.enum(["public", "unlisted", "private"]),
     variant: z.enum(["classic", "slim", "unknown"]),
     texture: mineSkinSkinTextureSchema,
@@ -138,7 +138,7 @@ const mineSkinJobSuccessSchema = z
     messages: z.array(mineSkinErrorSchema).optional(),
     links: z
       .object({
-        self: z.string().url().optional(),
+        self: z.string().optional(),
       })
       .catchall(z.unknown())
       .optional(),
@@ -326,12 +326,9 @@ async function requestMineSkinJob(
     throw new UpstreamError(status, getMineSkinErrorMessage(data));
   }
 
-  console.log("MineSkin response data:", JSON.stringify(data, null, 2));
-
   try {
     return mineSkinJobSuccessSchema.parse(data);
-  } catch (parseError) {
-    console.error("Parse error:", parseError);
+  } catch {
     throw new UpstreamError(502, "Unexpected MineSkin job response");
   }
 }
