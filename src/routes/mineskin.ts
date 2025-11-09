@@ -272,6 +272,26 @@ class UpstreamError extends Error {
   }
 }
 
+function logMineSkinParsingError(
+  context: string,
+  response: unknown,
+  error: unknown,
+): void {
+  const payload: Record<string, unknown> = { response };
+
+  if (error instanceof Error) {
+    payload.error = {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  } else if (error !== undefined) {
+    payload.error = error;
+  }
+
+  console.error(`[MineSkin] Failed to parse ${context}`, payload);
+}
+
 const uploadNameSchema = z.string().trim().min(1).max(64).optional();
 
 const uploadFormSchema = z.object({
@@ -396,6 +416,7 @@ async function requestMineSkinJob(
     const parsed = mineSkinJobSuccessSchema.parse(data);
     return encryptMineSkinUrls(parsed) as MineSkinJobSuccessResponse;
   } catch (error) {
+    logMineSkinParsingError("MineSkin job response", data, error);
     if (error instanceof z.ZodError) {
       const details = error.issues
         .map((issue) => {
@@ -463,7 +484,8 @@ async function enqueueMineSkinJob(
 
   try {
     return mineSkinJobDetailsSchema.parse(data.job);
-  } catch {
+  } catch (error) {
+    logMineSkinParsingError("MineSkin job enqueue response", data, error);
     throw new UpstreamError(502, "Unexpected MineSkin job response");
   }
 }
@@ -491,7 +513,8 @@ async function fetchMineSkinSupportedCapes(): Promise<MineSkinCape[]> {
   try {
     const parsed = z.array(mineSkinCapeSchema).parse(capes);
     return encryptMineSkinUrls(parsed) as MineSkinCape[];
-  } catch {
+  } catch (error) {
+    logMineSkinParsingError("MineSkin cape response", capes, error);
     throw new UpstreamError(502, "Unexpected MineSkin cape response");
   }
 }
