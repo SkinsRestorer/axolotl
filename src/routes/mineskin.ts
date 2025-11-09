@@ -188,11 +188,15 @@ const mineSkinUsageInfoSchema = z
   })
   .passthrough();
 
+const mineSkinSkinResultSchema = z
+  .union([mineSkinSkinSchema, z.literal(false)])
+  .nullish();
+
 const mineSkinJobSuccessSchema = z
   .object({
     success: z.literal(true),
     job: mineSkinJobDetailsSchema,
-    skin: mineSkinSkinSchema.nullish(),
+    skin: mineSkinSkinResultSchema,
     rateLimit: mineSkinRateLimitInfoSchema.nullish(),
     usage: mineSkinUsageInfoSchema.nullish(),
     errors: z.array(mineSkinErrorSchema).optional(),
@@ -391,7 +395,20 @@ async function requestMineSkinJob(
   try {
     const parsed = mineSkinJobSuccessSchema.parse(data);
     return encryptMineSkinUrls(parsed) as MineSkinJobSuccessResponse;
-  } catch {
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      const details = error.issues
+        .map((issue) => {
+          const path = issue.path.join(".");
+          return path ? `${path}: ${issue.message}` : issue.message;
+        })
+        .filter((detail): detail is string => Boolean(detail))
+        .join("; ");
+
+      const suffix = details ? `: ${details}` : "";
+      throw new UpstreamError(502, `Unexpected MineSkin job response${suffix}`);
+    }
+
     throw new UpstreamError(502, "Unexpected MineSkin job response");
   }
 }
