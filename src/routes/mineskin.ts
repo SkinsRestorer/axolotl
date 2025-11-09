@@ -88,7 +88,7 @@ const mineSkinJobDetailsSchema = z
   .object({
     id: z.string(),
     status: jobStatusSchema,
-    result: z.string().optional(),
+    result: z.string().nullish(),
   })
   .passthrough();
 
@@ -110,8 +110,8 @@ const mineSkinSkinUrlsSchema = z.object({
 const mineSkinSkinTextureSchema = z
   .object({
     data: mineSkinValueAndSignatureSchema,
-    hash: mineSkinSkinHashesSchema.optional(),
-    url: mineSkinSkinUrlsSchema.optional(),
+    hash: mineSkinSkinHashesSchema.nullish(),
+    url: mineSkinSkinUrlsSchema.nullish(),
   })
   .passthrough();
 
@@ -192,9 +192,9 @@ const mineSkinJobSuccessSchema = z
   .object({
     success: z.literal(true),
     job: mineSkinJobDetailsSchema,
-    skin: mineSkinSkinSchema.optional(),
-    rateLimit: mineSkinRateLimitInfoSchema.optional(),
-    usage: mineSkinUsageInfoSchema.optional(),
+    skin: mineSkinSkinSchema.nullish(),
+    rateLimit: mineSkinRateLimitInfoSchema.nullish(),
+    usage: mineSkinUsageInfoSchema.nullish(),
     errors: z.array(mineSkinErrorSchema).optional(),
     warnings: z.array(mineSkinErrorSchema).optional(),
     messages: z.array(mineSkinErrorSchema).optional(),
@@ -226,8 +226,8 @@ type MineSkinGenericResponse = {
   errors?: MineSkinError[] | undefined;
   warnings?: MineSkinError[] | undefined;
   messages?: MineSkinError[] | undefined;
-  rateLimit?: MineSkinRateLimitInfo | undefined;
-  usage?: MineSkinUsageInfo | undefined;
+  rateLimit?: MineSkinRateLimitInfo | null | undefined;
+  usage?: MineSkinUsageInfo | null | undefined;
 };
 
 type MineSkinEnqueueResponse = MineSkinGenericResponse & {
