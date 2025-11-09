@@ -75,6 +75,7 @@ const jobStatusSchema = z.enum([
   "unknown",
   "waiting",
   "active",
+  "processing",
   "failed",
   "completed",
 ]);
