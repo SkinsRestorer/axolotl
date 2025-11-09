@@ -11,6 +11,7 @@ import { FormData as UndiciFormData, fetch as undiciFetch } from "undici";
 
 const MINESKIN_BASE_URL = "https://api.mineskin.org/v2";
 const MINESKIN_USER_AGENT = "Axolotl-MineSkin-Proxy/1.0";
+const ENCRYPTED_URL_SCHEME = "skinsrestorer-axolotl://";
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_DURATION_MS = 5 * 60 * 1_000;
 const CAPE_CACHE_TTL_MS = 5 * 60 * 1_000;
@@ -33,15 +34,18 @@ function encryptUrl(url: string): string {
   let encrypted = cipher.update(url, "utf8", "base64");
   encrypted += cipher.final("base64");
   const combined = Buffer.concat([iv, Buffer.from(encrypted, "base64")]);
-  return `skinsrestorer-resolable://${combined.toString("base64")}`;
+  return `${ENCRYPTED_URL_SCHEME}${combined.toString("base64")}`;
 }
 
 function decryptUrl(encryptedUrl: string): string {
-  if (!encryptedUrl.startsWith("skinsrestorer-resolable://")) {
+  if (!encryptedUrl.startsWith(ENCRYPTED_URL_SCHEME)) {
     throw new Error("Invalid encrypted URL format");
   }
   const key = getAesSecretKey();
-  const combined = Buffer.from(encryptedUrl.slice(25), "base64");
+  const combined = Buffer.from(
+    encryptedUrl.slice(ENCRYPTED_URL_SCHEME.length),
+    "base64",
+  );
   const iv = combined.subarray(0, 16);
   const encrypted = combined.subarray(16);
   const decipher = createDecipheriv("aes-256-cbc", key, iv);
@@ -69,6 +73,30 @@ function encryptMineSkinUrls(obj: unknown): unknown {
     return result;
   }
   return obj;
+}
+
+function sanitizeMineSkinJobResponse(
+  data: MineSkinJobSuccessResponse,
+): MineSkinSanitizedResponse {
+  let skin: MineSkinSanitizedResponse["skin"] = null;
+
+  const skinData = data.skin;
+  if (
+    skinData &&
+    typeof skinData === "object" &&
+    "uuid" in skinData &&
+    typeof skinData.uuid === "string"
+  ) {
+    const encryptedUrl = encryptUrl(`https://minesk.in/${skinData.uuid}`);
+    skin = { url: encryptedUrl };
+  }
+
+  return {
+    success: true,
+    skin,
+    warnings: data.warnings ?? [],
+    messages: data.messages ?? [],
+  };
 }
 
 const jobStatusSchema = z.enum([
@@ -212,6 +240,17 @@ const mineSkinJobSuccessSchema = z
   })
   .passthrough();
 
+const mineSkinSanitizedSkinSchema = z.object({
+  url: z.string(),
+});
+
+const mineSkinSanitizedResponseSchema = z.object({
+  success: z.literal(true),
+  skin: mineSkinSanitizedSkinSchema.nullable(),
+  warnings: z.array(mineSkinErrorSchema).default([]),
+  messages: z.array(mineSkinErrorSchema).default([]),
+});
+
 const mineSkinCapeSchema = z.object({
   uuid: z.string(),
   alias: z.string(),
@@ -221,6 +260,9 @@ const mineSkinCapeSchema = z.object({
 type MineSkinError = z.infer<typeof mineSkinErrorSchema>;
 type MineSkinJobDetails = z.infer<typeof mineSkinJobDetailsSchema>;
 type MineSkinJobSuccessResponse = z.infer<typeof mineSkinJobSuccessSchema>;
+type MineSkinSanitizedResponse = z.infer<
+  typeof mineSkinSanitizedResponseSchema
+>;
 type MineSkinCape = z.infer<typeof mineSkinCapeSchema>;
 
 type MineSkinRateLimitInfo = z.infer<typeof mineSkinRateLimitInfoSchema>;
@@ -399,7 +441,7 @@ function isFileLike(value: unknown): value is Blob {
   return typeof (value as Blob).arrayBuffer === "function";
 }
 
-async function requestMineSkinJob(
+async function fetchMineSkinJob(
   jobId: string,
 ): Promise<MineSkinJobSuccessResponse> {
   const response = await undiciFetch(`${MINESKIN_BASE_URL}/queue/${jobId}`, {
@@ -415,7 +457,7 @@ async function requestMineSkinJob(
 
   try {
     const parsed = mineSkinJobSuccessSchema.parse(data);
-    return encryptMineSkinUrls(parsed) as MineSkinJobSuccessResponse;
+    return parsed;
   } catch (error) {
     logMineSkinParsingError("MineSkin job response", data, error);
     if (error instanceof z.ZodError) {
@@ -438,11 +480,11 @@ async function requestMineSkinJob(
 async function pollMineSkinJob(
   jobId: string,
   waitMs: number,
-): Promise<MineSkinJobSuccessResponse> {
+): Promise<MineSkinSanitizedResponse> {
   const maxAttempts = Math.max(1, Math.ceil(MAX_POLL_DURATION_MS / waitMs));
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const jobData = await requestMineSkinJob(jobId);
+    const jobData = await fetchMineSkinJob(jobId);
     const { status } = jobData.job;
 
     if (status === "completed") {
@@ -452,7 +494,7 @@ async function pollMineSkinJob(
           "MineSkin job completed but no skin data provided",
         );
       }
-      return jobData;
+      return sanitizeMineSkinJobResponse(jobData);
     }
 
     if (status === "failed") {
@@ -609,7 +651,7 @@ const uploadRoute = createRoute({
       description: "MineSkin job completed successfully.",
       content: {
         "application/json": {
-          schema: mineSkinJobSuccessSchema,
+          schema: mineSkinSanitizedResponseSchema,
         },
       },
     },
@@ -725,7 +767,7 @@ const jobStatusRoute = createRoute({
       description: "Job retrieved successfully.",
       content: {
         "application/json": {
-          schema: mineSkinJobSuccessSchema,
+          schema: mineSkinSanitizedResponseSchema,
         },
       },
     },
@@ -760,8 +802,8 @@ mineskinRouter.openapi(jobStatusRoute, async (c) => {
   const { jobId } = c.req.valid("param");
 
   try {
-    const job = await requestMineSkinJob(jobId);
-    return c.json(job, 200);
+    const job = await fetchMineSkinJob(jobId);
+    return c.json(sanitizeMineSkinJobResponse(job), 200);
   } catch (error) {
     console.error(`Failed to fetch MineSkin job ${jobId}`, error);
     if (error instanceof ConfigurationError) {
