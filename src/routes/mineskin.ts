@@ -11,6 +11,7 @@ import { FormData as UndiciFormData, fetch as undiciFetch } from "undici";
 
 const MINESKIN_BASE_URL = "https://api.mineskin.org/v2";
 const MINESKIN_USER_AGENT = "Axolotl-MineSkin-Proxy/1.0";
+const MINESKIN_URL_PREFIX = "https://minesk.in/";
 const ENCRYPTED_URL_SCHEME = "skinsrestorer-axolotl://";
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_DURATION_MS = 5 * 60 * 1_000;
@@ -27,14 +28,27 @@ function getAesSecretKey(): Buffer {
   return createHash("sha256").update(key).digest();
 }
 
-function encryptUrl(url: string): string {
+function encryptMineSkinUuid(uuid: string): string {
   const key = getAesSecretKey();
   const iv = randomBytes(16);
   const cipher = createCipheriv("aes-256-cbc", key, iv);
-  let encrypted = cipher.update(url, "utf8", "base64");
-  encrypted += cipher.final("base64");
-  const combined = Buffer.concat([iv, Buffer.from(encrypted, "base64")]);
-  return `${ENCRYPTED_URL_SCHEME}${combined.toString("base64")}`;
+  const encrypted = Buffer.concat([
+    cipher.update(uuid, "utf8"),
+    cipher.final(),
+  ]);
+  const combined = Buffer.concat([iv, encrypted]);
+  const encoded = combined.toString("base64");
+
+  return `${ENCRYPTED_URL_SCHEME}${encoded}`;
+}
+
+function encryptUrl(url: string): string {
+  if (!url.startsWith(MINESKIN_URL_PREFIX)) {
+    throw new Error("MineSkin encryption only supports https://minesk.in URLs");
+  }
+
+  const uuid = url.slice(MINESKIN_URL_PREFIX.length);
+  return encryptMineSkinUuid(uuid);
 }
 
 function decryptUrl(encryptedUrl: string): string {
@@ -42,22 +56,23 @@ function decryptUrl(encryptedUrl: string): string {
     throw new Error("Invalid encrypted URL format");
   }
   const key = getAesSecretKey();
-  const combined = Buffer.from(
-    encryptedUrl.slice(ENCRYPTED_URL_SCHEME.length),
-    "base64",
-  );
+  const base64Payload = encryptedUrl.slice(ENCRYPTED_URL_SCHEME.length);
+
+  const combined = Buffer.from(base64Payload, "base64");
   const iv = combined.subarray(0, 16);
   const encrypted = combined.subarray(16);
   const decipher = createDecipheriv("aes-256-cbc", key, iv);
   let decrypted = decipher.update(encrypted);
   decrypted = Buffer.concat([decrypted, decipher.final()]);
-  return decrypted.toString("utf8");
+  const uuid = decrypted.toString("utf8");
+
+  return `${MINESKIN_URL_PREFIX}${uuid}`;
 }
 
 function encryptMineSkinUrls(obj: unknown): unknown {
   if (typeof obj === "string") {
     // Check if it's a URL (basic check)
-    if (obj.startsWith("http://") || obj.startsWith("https://")) {
+    if (obj.startsWith(MINESKIN_URL_PREFIX)) {
       return encryptUrl(obj);
     }
     return obj;
@@ -87,7 +102,7 @@ function sanitizeMineSkinJobResponse(
     "uuid" in skinData &&
     typeof skinData.uuid === "string"
   ) {
-    const encryptedUrl = encryptUrl(`https://minesk.in/${skinData.uuid}`);
+    const encryptedUrl = encryptMineSkinUuid(skinData.uuid);
     skin = { url: encryptedUrl };
   }
 
