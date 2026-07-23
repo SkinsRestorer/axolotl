@@ -47,7 +47,7 @@ impl UrlCipher {
             .decode(payload)
             .map_err(|_| CryptoError::InvalidPayload)?;
 
-        if combined.len() < 32 || (combined.len() - 16) % 16 != 0 {
+        if combined.len() < 32 || !combined.len().is_multiple_of(16) {
             return Err(CryptoError::InvalidPayload);
         }
 
@@ -80,7 +80,14 @@ impl UrlCipher {
         let ciphertext = Aes256CbcEncryptor::new(key.into(), (&iv).into())
             .encrypt_padded::<Pkcs7>(&mut buffer, plaintext.len())
             .map_err(|_| CryptoError::Encryption)?;
-        let mut combined = Vec::with_capacity(iv.len() + ciphertext.len());
+        let combined_length = iv
+            .len()
+            .checked_add(ciphertext.len())
+            .ok_or(CryptoError::Encryption)?;
+        let mut combined = Vec::new();
+        combined
+            .try_reserve_exact(combined_length)
+            .map_err(|_| CryptoError::Encryption)?;
         combined.extend_from_slice(&iv);
         combined.extend_from_slice(ciphertext);
 
@@ -120,27 +127,27 @@ mod tests {
         "AAECAwQFBgcICQoLDA0OD8imM586fmS6OpsiL50KsnvRWjSo4S7vTKK3sl3b3l7RG1vToG52Tih6IdrpltHyHA==";
 
     #[test]
-    fn matches_legacy_crypto_vector() {
+    fn matches_legacy_crypto_vector() -> Result<(), CryptoError> {
         let cipher = UrlCipher::new(Some("test-secret"));
         let iv = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f,
         ];
 
-        let encrypted = cipher.encrypt_uuid_with_iv(UUID, iv).unwrap();
+        let encrypted = cipher.encrypt_uuid_with_iv(UUID, iv)?;
 
         assert_eq!(encrypted, format!("{ENCRYPTED_URL_SCHEME}{LEGACY_PAYLOAD}"));
+        Ok(())
     }
 
     #[test]
-    fn decrypts_legacy_crypto_vector() {
+    fn decrypts_legacy_crypto_vector() -> Result<(), CryptoError> {
         let cipher = UrlCipher::new(Some("test-secret"));
 
-        let decrypted = cipher
-            .decrypt_url(&format!("{ENCRYPTED_URL_SCHEME}{LEGACY_PAYLOAD}"))
-            .unwrap();
+        let decrypted = cipher.decrypt_url(&format!("{ENCRYPTED_URL_SCHEME}{LEGACY_PAYLOAD}"))?;
 
         assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{UUID}"));
+        Ok(())
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, error::Error, io};
 
 use axolotl::{AppConfig, api_document, build_app};
 use axum::{
@@ -18,46 +18,44 @@ const LEGACY_ENCRYPTED_URL: &str = "skinsrestorer-axolotl://AAECAwQFBgcICQoLDA0O
 const SKIN_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const CAPE_UUID: &str = "123e4567-e89b-12d3-a456-426614174001";
 
+type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
 #[tokio::test]
-async fn serves_health_and_json_not_found_responses() {
-    let app = test_app("http://127.0.0.1:9/v2/");
+async fn serves_health_and_json_not_found_responses() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
 
-    let health = send(&app, Request::get("/health").body(Body::empty()).unwrap()).await;
+    let health = send(&app, Request::get("/health").body(Body::empty())?).await?;
     assert_eq!(health.status(), StatusCode::OK);
-    assert_eq!(json_body(health).await, json!({ "status": "UP" }));
+    assert_eq!(json_body(health).await?, json!({ "status": "UP" }));
 
-    let missing = send(
-        &app,
-        Request::get("/does-not-exist").body(Body::empty()).unwrap(),
-    )
-    .await;
+    let missing = send(&app, Request::get("/does-not-exist").body(Body::empty())?).await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    assert_eq!(json_body(missing).await, json!({ "error": "Not Found" }));
+    assert_eq!(json_body(missing).await?, json!({ "error": "Not Found" }));
+    Ok(())
 }
 
 #[tokio::test]
-async fn decrypts_urls_created_by_the_legacy_service() {
-    let app = test_app("http://127.0.0.1:9/v2/");
+async fn decrypts_urls_created_by_the_legacy_service() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("encryptedUrl", LEGACY_ENCRYPTED_URL)
         .finish();
     let response = send(
         &app,
-        Request::get(format!("/mineskin/decrypt-url?{query}"))
-            .body(Body::empty())
-            .unwrap(),
+        Request::get(format!("/mineskin/decrypt-url?{query}")).body(Body::empty())?,
     )
-    .await;
+    .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        json_body(response).await,
+        json_body(response).await?,
         json!({ "url": format!("https://minesk.in/{SKIN_UUID}") })
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn caches_supported_capes_and_normalizes_texture_urls() {
+async fn caches_supported_capes_and_normalizes_texture_urls() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v2/capes"))
@@ -82,17 +80,13 @@ async fn caches_supported_capes_and_normalizes_texture_urls() {
         .expect(1)
         .mount(&server)
         .await;
-    let app = test_app(&format!("{}/v2/", server.uri()));
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
 
     for _ in 0..2 {
-        let response = send(
-            &app,
-            Request::get("/mineskin/capes").body(Body::empty()).unwrap(),
-        )
-        .await;
+        let response = send(&app, Request::get("/mineskin/capes").body(Body::empty())?).await?;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            json_body(response).await,
+            json_body(response).await?,
             json!({
                 "capes": [{
                     "uuid": CAPE_UUID,
@@ -104,10 +98,11 @@ async fn caches_supported_capes_and_normalizes_texture_urls() {
     }
 
     server.verify().await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn maps_mineskin_job_not_found_to_the_public_contract() {
+async fn maps_mineskin_job_not_found_to_the_public_contract() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v2/queue/missing"))
@@ -117,25 +112,24 @@ async fn maps_mineskin_job_not_found_to_the_public_contract() {
         })))
         .mount(&server)
         .await;
-    let app = test_app(&format!("{}/v2/", server.uri()));
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
 
     let response = send(
         &app,
-        Request::get("/mineskin/jobs/missing")
-            .body(Body::empty())
-            .unwrap(),
+        Request::get("/mineskin/jobs/missing").body(Body::empty())?,
     )
-    .await;
+    .await?;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        json_body(response).await,
+        json_body(response).await?,
         json!({ "error": "Job not found" })
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn forwards_uploads_and_returns_an_encrypted_skin_url() {
+async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v2/capes"))
@@ -177,7 +171,7 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() {
         .expect(1)
         .mount(&server)
         .await;
-    let app = test_app(&format!("{}/v2/", server.uri()));
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
     let boundary = "axolotl-integration-boundary";
     let body = multipart_upload(boundary);
 
@@ -188,43 +182,61 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() {
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
             )
-            .body(Body::from(body))
-            .unwrap(),
+            .body(Body::from(body))?,
     )
-    .await;
+    .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    let response = json_body(response).await;
-    assert_eq!(response["success"], json!(true));
-    assert_eq!(response["warnings"], json!([]));
-    assert_eq!(response["messages"], json!([]));
-    let encrypted_url = response["skin"]["url"].as_str().unwrap();
+    let response = json_body(response).await?;
+    assert_eq!(
+        response
+            .get("success")
+            .ok_or_else(|| io::Error::other("response did not contain success"))?,
+        &json!(true)
+    );
+    assert_eq!(
+        response
+            .get("warnings")
+            .ok_or_else(|| io::Error::other("response did not contain warnings"))?,
+        &json!([])
+    );
+    assert_eq!(
+        response
+            .get("messages")
+            .ok_or_else(|| io::Error::other("response did not contain messages"))?,
+        &json!([])
+    );
+    let encrypted_url = response
+        .get("skin")
+        .and_then(|skin| skin.get("url"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("response did not contain an encrypted skin URL"))?;
 
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("encryptedUrl", encrypted_url)
         .finish();
     let decrypted = send(
         &app,
-        Request::get(format!("/mineskin/decrypt-url?{query}"))
-            .body(Body::empty())
-            .unwrap(),
+        Request::get(format!("/mineskin/decrypt-url?{query}")).body(Body::empty())?,
     )
-    .await;
+    .await?;
     assert_eq!(decrypted.status(), StatusCode::OK);
     assert_eq!(
-        json_body(decrypted).await,
+        json_body(decrypted).await?,
         json!({ "url": format!("https://minesk.in/{SKIN_UUID}") })
     );
 
     server.verify().await;
+    Ok(())
 }
 
 #[test]
-fn openapi_document_exposes_the_complete_public_surface() {
-    let value = serde_json::to_value(api_document(4242)).unwrap();
-    let paths = value["paths"]
-        .as_object()
-        .unwrap()
+fn openapi_document_exposes_the_complete_public_surface() -> TestResult {
+    let value = serde_json::to_value(api_document(4242))?;
+    let paths = value
+        .get("paths")
+        .and_then(Value::as_object)
+        .ok_or_else(|| io::Error::other("OpenAPI document did not contain a paths object"))?
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -240,23 +252,36 @@ fn openapi_document_exposes_the_complete_public_surface() {
     .map(str::to_owned)
     .collect();
 
-    assert_eq!(value["openapi"], "3.1.0");
+    let openapi_version = value
+        .get("openapi")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("OpenAPI document did not contain a version"))?;
+    let local_server_url = value
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| servers.get(1))
+        .and_then(|server| server.get("url"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("OpenAPI document did not contain the local server URL"))?;
+
+    assert_eq!(openapi_version, "3.1.0");
     assert_eq!(paths, expected);
-    assert_eq!(value["servers"][1]["url"], "http://localhost:4242");
+    assert_eq!(local_server_url, "http://localhost:4242");
+    Ok(())
 }
 
-fn test_app(base_url: &str) -> Router {
-    let config = AppConfig::for_tests(Url::parse(base_url).unwrap());
-    build_app(&config).unwrap()
+fn test_app(base_url: &str) -> TestResult<Router> {
+    let config = AppConfig::for_tests(Url::parse(base_url)?);
+    Ok(build_app(&config)?)
 }
 
-async fn send(app: &Router, request: Request<Body>) -> Response<Body> {
-    app.clone().oneshot(request).await.unwrap()
+async fn send(app: &Router, request: Request<Body>) -> TestResult<Response<Body>> {
+    Ok(app.clone().oneshot(request).await?)
 }
 
-async fn json_body(response: Response<Body>) -> Value {
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+async fn json_body(response: Response<Body>) -> TestResult<Value> {
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn completed_job_response() -> Value {
