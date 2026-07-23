@@ -9,6 +9,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_POLL_DURATION: Duration = Duration::from_mins(5);
 const DEFAULT_CAPE_CACHE_TTL: Duration = Duration::from_mins(5);
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 16;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -20,6 +21,7 @@ pub struct AppConfig {
     pub(crate) default_poll_interval: Duration,
     pub(crate) max_poll_duration: Duration,
     pub(crate) cape_cache_ttl: Duration,
+    pub(crate) max_concurrent_uploads: usize,
 }
 
 impl AppConfig {
@@ -47,6 +49,7 @@ impl AppConfig {
             default_poll_interval: DEFAULT_POLL_INTERVAL,
             max_poll_duration: DEFAULT_MAX_POLL_DURATION,
             cape_cache_ttl: DEFAULT_CAPE_CACHE_TTL,
+            max_concurrent_uploads: DEFAULT_MAX_CONCURRENT_UPLOADS,
         })
     }
 
@@ -67,6 +70,7 @@ impl AppConfig {
             default_poll_interval: Duration::from_millis(1),
             max_poll_duration: Duration::from_secs(1),
             cape_cache_ttl: DEFAULT_CAPE_CACHE_TTL,
+            max_concurrent_uploads: 1,
         }
     }
 }

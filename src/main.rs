@@ -24,8 +24,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_tracing()?;
 
     let config = AppConfig::from_env()?;
-    let address = SocketAddr::from(([0, 0, 0, 0], config.port()));
+    let port = config.port();
+    let address = SocketAddr::from(([0, 0, 0, 0], port));
     let app = build_app(&config)?;
+    drop(config);
     let listener = TcpListener::bind(address).await?;
 
     info!(%address, "Axolotl server started");

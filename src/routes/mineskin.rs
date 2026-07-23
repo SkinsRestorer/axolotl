@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json,
@@ -8,6 +8,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 use tracing::error;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -88,13 +89,15 @@ pub struct DecryptedUrlResponse {
     responses(
         (status = 200, description = "MineSkin job completed successfully.", body = SanitizedResponse),
         (status = 400, description = "Invalid request payload.", body = ErrorResponse),
+        (status = 408, description = "The upload request exceeded its execution deadline.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse),
+        (status = 503, description = "The upload concurrency limit has been reached.", body = ErrorResponse),
         (status = 504, description = "Timed out waiting for MineSkin to finish processing.", body = ErrorResponse)
     )
 )]
 pub async fn upload_skin(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     query: Result<Query<UploadQuery>, QueryRejection>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
@@ -103,10 +106,14 @@ pub async fn upload_skin(
         state.mineskin.default_poll_interval(),
         Duration::from_millis,
     ))?;
-    let upload = parse_upload(
-        multipart.map_err(|_| ApiError::bad_request("Failed to parse multipart form data"))?,
+    let upload = timeout(
+        state.upload_body_timeout,
+        parse_upload(
+            multipart.map_err(|_| ApiError::bad_request("Failed to parse multipart form data"))?,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| ApiError::new(StatusCode::REQUEST_TIMEOUT, "Skin upload body timed out"))??;
 
     let supported_capes = state
         .mineskin
@@ -150,7 +157,7 @@ pub async fn upload_skin(
     )
 )]
 pub async fn job_status(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Path(path): Path<JobPath>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
     let job = state
@@ -178,7 +185,7 @@ pub async fn job_status(
     )
 )]
 pub async fn supported_capes(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<CapesResponse>, ApiError> {
     let capes = state
         .mineskin
@@ -201,7 +208,7 @@ pub async fn supported_capes(
     )
 )]
 pub async fn cape_support(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<CapeSupportResponse>, ApiError> {
     let (grant, capes) = tokio::join!(
         state.mineskin.has_cape_grant(),
@@ -212,7 +219,7 @@ pub async fn cape_support(
 
     Ok(Json(CapeSupportResponse {
         has_cape_grant,
-        capes: if has_cape_grant { capes } else { Vec::new() },
+        capes: if has_cape_grant { capes } else { Arc::from([]) },
     }))
 }
 
@@ -231,7 +238,7 @@ pub async fn cape_support(
     )
 )]
 pub async fn decrypt_url(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     query: Result<Query<DecryptUrlQuery>, QueryRejection>,
 ) -> Result<Json<DecryptedUrlResponse>, ApiError> {
     let Query(query) = query.map_err(|error| ApiError::bad_request(error.body_text()))?;
@@ -243,6 +250,7 @@ pub async fn decrypt_url(
             CryptoError::InvalidFormat
             | CryptoError::InvalidPayload
             | CryptoError::UnsupportedUrl
+            | CryptoError::InvalidUuid
             | CryptoError::Encryption
             | CryptoError::Randomness => ApiError::bad_request(error.to_string()),
         })?;
@@ -317,8 +325,10 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
     let cape_uuid = cape_uuid
         .or(cape_alias)
         .ok_or_else(|| ApiError::bad_request("capeUuid is required"))?;
-    Uuid::parse_str(&cape_uuid)
-        .map_err(|_| ApiError::bad_request("capeUuid must be a valid UUID"))?;
+    let cape_uuid = Uuid::parse_str(&cape_uuid)
+        .map_err(|_| ApiError::bad_request("capeUuid must be a valid UUID"))?
+        .hyphenated()
+        .to_string();
 
     Ok(UploadPayload {
         file,
@@ -351,10 +361,12 @@ fn validate_poll_interval(interval: Duration) -> Result<Duration, ApiError> {
 fn map_upload_error(error: &MineSkinClientError) -> ApiError {
     error!(%error, "MineSkin upload failed");
 
+    if error.is_configuration_error() {
+        return ApiError::internal(error.to_string());
+    }
+
     match error {
-        MineSkinClientError::Configuration(_) | MineSkinClientError::Crypto(_) => {
-            ApiError::internal(error.to_string())
-        }
+        MineSkinClientError::Configuration(_) => ApiError::internal(error.to_string()),
         MineSkinClientError::InvalidUpload(_) => ApiError::bad_request(error.to_string()),
         MineSkinClientError::Upstream { status, .. } => match *status {
             StatusCode::BAD_REQUEST => ApiError::bad_request(error.to_string()),
@@ -363,9 +375,9 @@ fn map_upload_error(error: &MineSkinClientError) -> ApiError {
             }
             _ => ApiError::bad_gateway(error.to_string()),
         },
-        MineSkinClientError::Request(_) | MineSkinClientError::UnexpectedResponse { .. } => {
-            ApiError::bad_gateway(error.to_string())
-        }
+        MineSkinClientError::Request(_)
+        | MineSkinClientError::UnexpectedResponse { .. }
+        | MineSkinClientError::Crypto(_) => ApiError::bad_gateway(error.to_string()),
     }
 }
 

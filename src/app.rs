@@ -1,13 +1,17 @@
+use std::{sync::Arc, time::Duration};
+
 use axum::{
     Json, Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request, State},
     http::{
         HeaderValue, Method, StatusCode,
         header::{CONTENT_TYPE, LOCATION},
     },
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use tokio::{sync::Semaphore, time::timeout};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -21,7 +25,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::{
     config::AppConfig,
     crypto::UrlCipher,
-    error::ErrorResponse,
+    error::{ApiError, ErrorResponse},
     mineskin::MineSkinClient,
     routes::{
         __path_cape_support, __path_decrypt_url, __path_health, __path_job_status,
@@ -32,10 +36,12 @@ use crate::{
 
 const MAXIMUM_REQUEST_BODY_SIZE: usize = 6 * 1024 * 1024;
 
-#[derive(Clone)]
 pub(crate) struct AppState {
     pub mineskin: MineSkinClient,
     pub cipher: UrlCipher,
+    pub upload_body_timeout: Duration,
+    upload_slots: Arc<Semaphore>,
+    upload_request_timeout: Duration,
 }
 
 #[derive(OpenApi)]
@@ -71,16 +77,27 @@ struct ApiDoc;
 /// Returns an error when the outbound `MineSkin` HTTP client cannot be created.
 pub fn build_app(config: &AppConfig) -> Result<Router, crate::mineskin::MineSkinClientError> {
     let cipher = UrlCipher::new(config.aes_secret_key.as_deref());
-    let state = AppState {
+    let state = Arc::new(AppState {
         mineskin: MineSkinClient::new(config, cipher.clone())?,
         cipher,
-    };
+        upload_body_timeout: config.request_timeout,
+        upload_slots: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
+        upload_request_timeout: config
+            .max_poll_duration
+            .saturating_add(config.request_timeout.saturating_mul(3)),
+    });
     let openapi = api_document(config.port);
 
     let api = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
-        .route("/mineskin/skins", post(upload_skin))
+        .route(
+            "/mineskin/skins",
+            post(upload_skin).route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                guard_upload,
+            )),
+        )
         .route("/mineskin/jobs/{jobId}", get(job_status))
         .route("/mineskin/capes", get(supported_capes))
         .route("/mineskin/cape-support", get(cape_support))
@@ -98,6 +115,26 @@ pub fn build_app(config: &AppConfig) -> Result<Router, crate::mineskin::MineSkin
         .layer(TraceLayer::new_for_http());
 
     Ok(api)
+}
+
+async fn guard_upload(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = Arc::clone(&state.upload_slots).try_acquire_owned() else {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many skin uploads are already in progress",
+        )
+        .into_response();
+    };
+
+    match timeout(state.upload_request_timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "Skin upload request timed out")
+            .into_response(),
+    }
 }
 
 #[must_use]

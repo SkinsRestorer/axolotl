@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, error::Error, io};
+use std::{collections::BTreeSet, error::Error, io, time::Duration};
 
 use axolotl::{AppConfig, api_document, build_app};
 use axum::{
@@ -7,6 +7,7 @@ use axum::{
     http::{Request, Response, StatusCode, header},
 };
 use serde_json::{Value, json};
+use tokio::time::{sleep, timeout};
 use tower::ServiceExt;
 use url::{Url, form_urlencoded};
 use wiremock::{
@@ -129,6 +130,119 @@ async fn maps_mineskin_job_not_found_to_the_public_contract() -> TestResult {
 }
 
 #[tokio::test]
+async fn accepts_new_upstream_job_statuses_without_parsing_unused_fields() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "job": {
+                "id": "job-new",
+                "status": "scheduled"
+            },
+            "skin": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = send(
+        &app,
+        Request::get("/mineskin/jobs/job-new").body(Body::empty())?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await?,
+        json!({
+            "success": true,
+            "skin": null,
+            "warnings": [],
+            "messages": []
+        })
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn deduplicates_concurrent_failed_cape_refreshes() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/capes"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_delay(Duration::from_millis(50))
+                .set_body_json(json!({
+                    "success": false,
+                    "errors": [{ "message": "temporary failure" }]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let first_request = Request::get("/mineskin/capes").body(Body::empty())?;
+    let second_request = Request::get("/mineskin/capes").body(Body::empty())?;
+    let (first, second) = tokio::join!(send(&app, first_request), send(&app, second_request));
+
+    assert_eq!(first?.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(second?.status(), StatusCode::BAD_GATEWAY);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_oversized_upstream_responses() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/capes"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![b'x'; 1024 * 1024 + 1], "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = send(&app, Request::get("/mineskin/capes").body(Body::empty())?).await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_non_https_cape_urls() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/capes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "capes": [{
+                "uuid": CAPE_UUID,
+                "alias": "founders",
+                "url": "ftp://textures.example/cape.png",
+                "supported": true
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = send(&app, Request::get("/mineskin/capes").body(Body::empty())?).await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -173,7 +287,7 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
         .await;
     let app = test_app(&format!("{}/v2/", server.uri()))?;
     let boundary = "axolotl-integration-boundary";
-    let body = multipart_upload(boundary);
+    let body = multipart_upload_with_cape(boundary, &CAPE_UUID.to_uppercase());
 
     let response = send(
         &app,
@@ -211,6 +325,7 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
         .and_then(|skin| skin.get("url"))
         .and_then(Value::as_str)
         .ok_or_else(|| io::Error::other("response did not contain an encrypted skin URL"))?;
+    assert!(encrypted_url.starts_with("skinsrestorer-axolotl://v2/"));
 
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("encryptedUrl", encrypted_url)
@@ -226,6 +341,59 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
         json!({ "url": format!("https://minesk.in/{SKIN_UUID}") })
     );
 
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_uploads_above_the_concurrency_limit_before_processing() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/capes"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(500))
+                .set_body_json(json!({
+                    "success": true,
+                    "capes": [{
+                        "uuid": CAPE_UUID,
+                        "alias": "founders",
+                        "url": "https://textures.example/cape.png",
+                        "supported": true
+                    }]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let first_app = app.clone();
+    let first_boundary = "axolotl-concurrency-first";
+    let first_request = Request::post("/mineskin/skins?waitMs=250")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={first_boundary}"),
+        )
+        .body(Body::from(multipart_upload(first_boundary)))?;
+    let first = tokio::spawn(async move { send(&first_app, first_request).await });
+    wait_for_upstream_path(&server, "/v2/capes").await?;
+
+    let second_boundary = "axolotl-concurrency-second";
+    let second = send(
+        &app,
+        Request::post("/mineskin/skins?waitMs=250")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={second_boundary}"),
+            )
+            .body(Body::from(multipart_upload(second_boundary)))?,
+    )
+    .await?;
+
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    first.abort();
+    let _ = first.await;
     server.verify().await;
     Ok(())
 }
@@ -329,6 +497,10 @@ fn completed_job_response() -> Value {
 }
 
 fn multipart_upload(boundary: &str) -> String {
+    multipart_upload_with_cape(boundary, CAPE_UUID)
+}
+
+fn multipart_upload_with_cape(boundary: &str, cape_uuid: &str) -> String {
     format!(
         "--{boundary}\r\n\
          Content-Disposition: form-data; name=\"file\"; filename=\"skin.png\"\r\n\
@@ -342,7 +514,25 @@ fn multipart_upload(boundary: &str) -> String {
          integration_skin\r\n\
          --{boundary}\r\n\
          Content-Disposition: form-data; name=\"capeUuid\"\r\n\r\n\
-         {CAPE_UUID}\r\n\
+         {cape_uuid}\r\n\
          --{boundary}--\r\n"
     )
+}
+
+async fn wait_for_upstream_path(server: &MockServer, expected_path: &str) -> TestResult {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server.received_requests().await.is_some_and(|requests| {
+                requests
+                    .iter()
+                    .any(|request| request.url.path() == expected_path)
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    Ok(())
 }

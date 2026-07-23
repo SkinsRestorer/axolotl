@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::{fmt, sync::Arc};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, IgnoredAny, MapAccess, Visitor},
+};
 use serde_json::Value;
 use utoipa::ToSchema;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct MineSkinErrorItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -12,42 +15,33 @@ pub struct MineSkinErrorItem {
     pub message: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobDetails {
     pub id: String,
     pub status: JobStatus,
-    #[serde(rename = "result")]
-    _result: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
-    Unknown,
     Waiting,
     Active,
     Processing,
     Failed,
     Completed,
+    #[serde(other)]
+    Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSuccessResponse {
     pub success: bool,
     pub job: JobDetails,
     pub skin: Option<SkinResult>,
-    #[serde(rename = "rateLimit")]
-    _rate_limit: Option<RateLimitInfo>,
-    #[serde(rename = "usage")]
-    _usage: Option<UsageInfo>,
-    #[serde(rename = "errors")]
-    _errors: Option<Vec<MineSkinErrorItem>>,
     pub warnings: Option<Vec<MineSkinErrorItem>>,
     pub messages: Option<Vec<MineSkinErrorItem>>,
-    #[serde(rename = "links")]
-    _links: Option<Links>,
 }
 
 impl JobSuccessResponse {
@@ -99,197 +93,101 @@ impl JobSuccessResponse {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 pub enum SkinResult {
-    Skin(Box<Skin>),
+    Skin(Skin),
     Boolean(bool),
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+impl<'de> Deserialize<'de> for SkinResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SkinResultVisitor)
+    }
+}
+
+struct SkinResultVisitor;
+
+impl<'de> Visitor<'de> for SkinResultVisitor {
+    type Value = SkinResult;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a MineSkin skin object or boolean")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(SkinResult::Boolean(value))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut uuid = None;
+
+        while let Some(field) = map.next_key()? {
+            match field {
+                SkinField::Uuid => {
+                    if uuid.is_some() {
+                        return Err(de::Error::duplicate_field("uuid"));
+                    }
+                    uuid = Some(map.next_value()?);
+                }
+                SkinField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        let uuid = uuid.ok_or_else(|| de::Error::missing_field("uuid"))?;
+        Ok(SkinResult::Skin(Skin { uuid }))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum SkinField {
+    Uuid,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug)]
 pub struct Skin {
     pub uuid: String,
-    #[serde(rename = "name")]
-    _name: Option<String>,
-    #[serde(rename = "visibility")]
-    _visibility: Visibility,
-    #[serde(rename = "variant")]
-    _variant: SkinVariant,
-    #[serde(rename = "texture")]
-    _texture: SkinTexture,
-    #[serde(rename = "generator")]
-    _generator: GeneratorInfo,
-    #[serde(rename = "views")]
-    _views: f64,
-    #[serde(rename = "duplicate")]
-    _duplicate: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Visibility {
-    Public,
-    Unlisted,
-    Private,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum SkinVariant {
-    Classic,
-    Slim,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct SkinTexture {
-    #[serde(rename = "data")]
-    _data: ValueAndSignature,
-    #[serde(rename = "hash")]
-    _hash: Option<SkinHashes>,
-    #[serde(rename = "url")]
-    _url: Option<SkinUrls>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ValueAndSignature {
-    #[serde(rename = "value")]
-    _value: String,
-    #[serde(rename = "signature")]
-    _signature: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct SkinHashes {
-    #[serde(rename = "skin")]
-    _skin: String,
-    #[serde(rename = "cape")]
-    _cape: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct SkinUrls {
-    #[serde(rename = "skin")]
-    _skin: String,
-    #[serde(rename = "cape")]
-    _cape: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GeneratorInfo {
-    #[serde(rename = "version")]
-    _version: String,
-    #[serde(rename = "timestamp")]
-    _timestamp: f64,
-    #[serde(rename = "duration")]
-    _duration: f64,
-    #[serde(rename = "account")]
-    _account: String,
-    #[serde(rename = "server")]
-    _server: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct RateLimitInfo {
-    #[serde(rename = "next")]
-    _next: NextRequest,
-    #[serde(rename = "delay")]
-    _delay: DelayInfo,
-    #[serde(rename = "limit")]
-    _limit: Option<LimitInfo>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct NextRequest {
-    #[serde(rename = "absolute")]
-    _absolute: f64,
-    #[serde(rename = "relative")]
-    _relative: f64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DelayInfo {
-    #[serde(rename = "millis")]
-    _millis: f64,
-    #[serde(rename = "seconds")]
-    _seconds: Option<f64>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct LimitInfo {
-    #[serde(rename = "limit")]
-    _limit: f64,
-    #[serde(rename = "remaining")]
-    _remaining: f64,
-    #[serde(rename = "reset")]
-    _reset: Option<f64>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct UsageInfo {
-    #[serde(rename = "credits")]
-    _credits: Option<CreditsUsage>,
-    #[serde(rename = "metered")]
-    _metered: Option<MeteredUsage>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct CreditsUsage {
-    #[serde(rename = "used")]
-    _used: f64,
-    #[serde(rename = "remaining")]
-    _remaining: f64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct MeteredUsage {
-    #[serde(rename = "used")]
-    _used: f64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct Links {
-    #[serde(rename = "self")]
-    _self_link: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GenericResponse {
+pub struct MineSkinResponse {
     pub success: Option<bool>,
     pub errors: Option<Vec<MineSkinErrorItem>>,
     pub warnings: Option<Vec<MineSkinErrorItem>>,
     pub messages: Option<Vec<MineSkinErrorItem>>,
+    pub job: Option<JobDetails>,
+    pub skin: Option<SkinResult>,
+    pub capes: Option<Vec<UpstreamCape>>,
+    pub grants: Option<Grants>,
 }
 
-impl GenericResponse {
+impl MineSkinResponse {
     #[must_use]
-    pub fn error_message(&self) -> String {
-        [&self.errors, &self.warnings, &self.messages]
+    pub fn into_error_message(self) -> String {
+        [self.errors, self.warnings, self.messages]
             .into_iter()
-            .filter_map(|items| items.as_ref())
             .flatten()
-            .find_map(|item| item.message.clone())
+            .flatten()
+            .find_map(|item| item.message)
             .unwrap_or_else(|| "MineSkin request failed".to_owned())
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct EnqueueResponse {
-    #[serde(flatten)]
-    pub generic: GenericResponse,
-    pub job: Option<JobDetails>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CapeResponse {
-    #[serde(flatten)]
-    pub generic: GenericResponse,
-    pub capes: Option<Vec<UpstreamCape>>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct UpstreamCape {
     pub uuid: String,
     pub alias: String,
@@ -297,14 +195,12 @@ pub struct UpstreamCape {
     pub supported: Option<bool>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct MeResponse {
-    #[serde(flatten)]
-    pub generic: GenericResponse,
-    pub grants: Option<HashMap<String, Value>>,
+#[derive(Debug, Deserialize)]
+pub struct Grants {
+    pub capes: Option<Value>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SanitizedResponse {
     pub success: bool,
     pub skin: Option<SanitizedSkin>,
@@ -312,12 +208,12 @@ pub struct SanitizedResponse {
     pub messages: Vec<MineSkinErrorItem>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SanitizedSkin {
     pub url: String,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct Cape {
     pub uuid: String,
     pub alias: String,
@@ -326,12 +222,14 @@ pub struct Cape {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CapesResponse {
-    pub capes: Vec<Cape>,
+    #[schema(value_type = Vec<Cape>)]
+    pub capes: Arc<[Cape]>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CapeSupportResponse {
     pub has_cape_grant: bool,
-    pub capes: Vec<Cape>,
+    #[schema(value_type = Vec<Cape>)]
+    pub capes: Arc<[Cape]>,
 }

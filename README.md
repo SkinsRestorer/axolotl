@@ -53,7 +53,9 @@ Missing route-specific credentials return a JSON configuration error. The health
 | `GET` | `/mineskin/cape-support` | Check the configured account's cape grant and list usable capes. |
 | `GET` | `/mineskin/decrypt-url` | Decrypt an Axolotl URL into its original `https://minesk.in/` URL. |
 
-Skin uploads accept up to 5 MiB. The upload endpoint can poll for at most five minutes and returns `504` if MineSkin does not finish in time.
+Skin uploads accept up to 5 MiB. Axolotl processes up to 16 uploads at once and returns `503` when every upload slot is occupied. Upload bodies and complete upload workflows have deadlines, while MineSkin polling can run for at most five minutes and returns `504` if processing does not finish in time.
+
+New encrypted URLs use an authenticated `v2` payload. The decryption endpoint continues to accept URLs created by the legacy AES-CBC service.
 
 ## Deploy with Railpack
 

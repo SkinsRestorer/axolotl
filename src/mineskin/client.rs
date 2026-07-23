@@ -4,6 +4,7 @@ use std::{
 };
 
 use axum::body::Bytes;
+use futures_util::StreamExt;
 use reqwest::{
     Client, RequestBuilder, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
@@ -13,11 +14,12 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::{sleep, timeout},
 };
-use tracing::error;
+use tracing::{error, warn};
 use url::Url;
+use uuid::Uuid;
 
 use crate::{
     config::AppConfig,
@@ -25,19 +27,20 @@ use crate::{
 };
 
 use super::models::{
-    Cape, CapeResponse, EnqueueResponse, GenericResponse, JobDetails, JobStatus,
-    JobSuccessResponse, MeResponse, SanitizedResponse,
+    Cape, JobDetails, JobStatus, JobSuccessResponse, MineSkinResponse, SanitizedResponse,
 };
 
 const MINESKIN_USER_AGENT: &str = "Axolotl-MineSkin-Proxy/1.0";
+const MAXIMUM_UPSTREAM_RESPONSE_SIZE: usize = 1024 * 1024;
+const INITIAL_UPSTREAM_RESPONSE_CAPACITY: usize = 16 * 1024;
+const CAPE_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 
-#[derive(Clone)]
 pub struct MineSkinClient {
     http: Client,
     base_url: Url,
-    api_key: Option<String>,
+    authorization: AuthorizationHeader,
     cipher: UrlCipher,
-    cache: Arc<Mutex<Option<CachedCapes>>>,
+    cache: CapeCache,
     default_poll_interval: Duration,
     max_poll_duration: Duration,
     cape_cache_ttl: Duration,
@@ -54,9 +57,9 @@ impl MineSkinClient {
         Ok(Self {
             http,
             base_url: config.mineskin_base_url.clone(),
-            api_key: config.mineskin_api_key.clone(),
+            authorization: AuthorizationHeader::new(config.mineskin_api_key.as_deref()),
             cipher,
-            cache: Arc::new(Mutex::new(None)),
+            cache: CapeCache::default(),
             default_poll_interval: config.default_poll_interval,
             max_poll_duration: config.max_poll_duration,
             cape_cache_ttl: config.cape_cache_ttl,
@@ -69,13 +72,19 @@ impl MineSkinClient {
     }
 
     pub async fn fetch_job(&self, job_id: &str) -> Result<JobSuccessResponse, MineSkinClientError> {
-        let url = self.endpoint(&format!("queue/{job_id}"))?;
+        let url = self.job_endpoint(job_id)?;
         let request = self.authorize(self.http.get(url))?;
-        let (status, value) = self.execute(request).await?;
-        let generic = generic_response(&value);
-
-        ensure_upstream_success(status, &generic)?;
-        let response: JobSuccessResponse = parse_response("MineSkin job response", &value)?;
+        let mut response = self.execute(request, "MineSkin job response").await?;
+        let job = response.job.take().ok_or_else(|| {
+            MineSkinClientError::unexpected("MineSkin job response", "job is missing")
+        })?;
+        let response = JobSuccessResponse {
+            success: true,
+            job,
+            skin: response.skin.take(),
+            warnings: response.warnings.take(),
+            messages: response.messages.take(),
+        };
         response
             .validate()
             .map_err(|message| MineSkinClientError::unexpected("MineSkin job response", message))?;
@@ -140,7 +149,9 @@ impl MineSkinClient {
     }
 
     pub async fn enqueue(&self, upload: UploadPayload) -> Result<JobDetails, MineSkinClientError> {
-        let mut file = Part::bytes(upload.file.to_vec())
+        let file_length = u64::try_from(upload.file.len())
+            .map_err(|_| MineSkinClientError::InvalidUpload("Skin file is too large".to_owned()))?;
+        let mut file = Part::stream_with_length(upload.file, file_length)
             .file_name(upload.file_name.unwrap_or_else(|| "skin.png".to_owned()));
         if let Some(content_type) = upload.content_type {
             file = file.mime_str(&content_type).map_err(|_| {
@@ -158,53 +169,107 @@ impl MineSkinClient {
 
         let url = self.endpoint("queue")?;
         let request = self.authorize(self.http.post(url))?.multipart(form);
-        let (status, value) = self.execute(request).await?;
-        let response: EnqueueResponse = parse_response("MineSkin job enqueue response", &value)?;
+        let mut response = self
+            .execute(request, "MineSkin job enqueue response")
+            .await?;
 
-        ensure_upstream_success(status, &response.generic)?;
-        response.job.ok_or_else(|| {
-            MineSkinClientError::upstream(StatusCode::BAD_GATEWAY, response.generic.error_message())
-        })
+        if let Some(job) = response.job.take() {
+            Ok(job)
+        } else {
+            Err(MineSkinClientError::upstream(
+                StatusCode::BAD_GATEWAY,
+                response.into_error_message(),
+            ))
+        }
     }
 
-    pub async fn supported_capes(&self) -> Result<Vec<Cape>, MineSkinClientError> {
-        let mut cache = self.cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed() < self.cape_cache_ttl
-        {
-            return Ok(cached.data.clone());
+    pub async fn supported_capes(&self) -> Result<Arc<[Cape]>, MineSkinClientError> {
+        let cached = self.cached_capes().await;
+        if let Some(cached) = cached.as_ref().filter(|cached| self.is_cache_fresh(cached)) {
+            return Ok(Arc::clone(&cached.data));
         }
 
-        let capes = self.fetch_supported_capes().await?;
-        *cache = Some(CachedCapes {
-            data: capes.clone(),
-            fetched_at: Instant::now(),
-        });
+        let refresh = match self.cache.refresh.try_lock() {
+            Ok(refresh) => refresh,
+            Err(_) => match &cached {
+                Some(cached) => return Ok(Arc::clone(&cached.data)),
+                None => self.cache.refresh.lock().await,
+            },
+        };
 
-        Ok(capes)
+        let cached = self.cached_capes().await;
+        if let Some(cached) = cached.as_ref().filter(|cached| self.is_cache_fresh(cached)) {
+            return Ok(Arc::clone(&cached.data));
+        }
+
+        if let Some(failure) = self.recent_cache_failure().await {
+            return cached
+                .map(|cached| Arc::clone(&cached.data))
+                .ok_or_else(|| failure.to_error());
+        }
+
+        match self.fetch_supported_capes().await {
+            Ok(capes) => {
+                let capes = Arc::<[Cape]>::from(capes);
+                let mut state = self.cache.state.write().await;
+                state.value = Some(Arc::new(CachedCapes {
+                    data: Arc::clone(&capes),
+                    fetched_at: Instant::now(),
+                }));
+                state.last_failure = None;
+                drop(refresh);
+
+                Ok(capes)
+            }
+            Err(error) => {
+                self.cache.state.write().await.last_failure = Some(CachedCapeFailure::new(&error));
+                drop(refresh);
+
+                if let Some(cached) = cached {
+                    warn!(%error, "Failed to refresh MineSkin capes; serving stale data");
+                    Ok(Arc::clone(&cached.data))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn cached_capes(&self) -> Option<Arc<CachedCapes>> {
+        self.cache.state.read().await.value.clone()
+    }
+
+    async fn recent_cache_failure(&self) -> Option<CachedCapeFailure> {
+        self.cache
+            .state
+            .read()
+            .await
+            .last_failure
+            .as_ref()
+            .filter(|failure| failure.failed_at.elapsed() < CAPE_REFRESH_RETRY_DELAY)
+            .cloned()
+    }
+
+    fn is_cache_fresh(&self, cached: &CachedCapes) -> bool {
+        cached.fetched_at.elapsed() < self.cape_cache_ttl
     }
 
     pub async fn has_cape_grant(&self) -> Result<bool, MineSkinClientError> {
         let url = self.endpoint("me")?;
         let request = self.authorize(self.http.get(url))?;
-        let (status, value) = self.execute(request).await?;
-        let response: MeResponse = parse_response("MineSkin account response", &value)?;
+        let response = self.execute(request, "MineSkin account response").await?;
 
-        ensure_upstream_success(status, &response.generic)?;
         Ok(response
             .grants
             .as_ref()
-            .and_then(|grants| grants.get("capes"))
+            .and_then(|grants| grants.capes.as_ref())
             .is_some_and(is_api_value_truthy))
     }
 
     async fn fetch_supported_capes(&self) -> Result<Vec<Cape>, MineSkinClientError> {
         let url = self.endpoint("capes")?;
         let request = self.authorize(self.http.get(url))?;
-        let (status, value) = self.execute(request).await?;
-        let response: CapeResponse = parse_response("MineSkin cape response", &value)?;
-
-        ensure_upstream_success(status, &response.generic)?;
+        let response = self.execute(request, "MineSkin cape response").await?;
 
         response
             .capes
@@ -212,7 +277,14 @@ impl MineSkinClient {
             .into_iter()
             .filter(|cape| cape.supported == Some(true))
             .map(|cape| {
-                let uuid = self.encrypt_mineskin_string(cape.uuid)?;
+                let uuid = Uuid::parse_str(&cape.uuid)
+                    .map(|uuid| uuid.hyphenated().to_string())
+                    .map_err(|_| {
+                        MineSkinClientError::unexpected(
+                            "MineSkin cape response",
+                            "cape UUID is invalid",
+                        )
+                    })?;
                 let alias = self.encrypt_mineskin_string(cape.alias)?;
                 let normalized_url = normalize_texture_url(&cape.url)?;
                 let url = self.encrypt_mineskin_string(normalized_url)?;
@@ -238,47 +310,77 @@ impl MineSkinClient {
             .map_err(|error| MineSkinClientError::Configuration(error.to_string()))
     }
 
-    fn authorize(&self, request: RequestBuilder) -> Result<RequestBuilder, MineSkinClientError> {
-        let raw_key = self
-            .api_key
-            .as_deref()
-            .ok_or_else(|| {
-                MineSkinClientError::Configuration("MineSkin API key is not configured".to_owned())
+    fn job_endpoint(&self, job_id: &str) -> Result<Url, MineSkinClientError> {
+        let mut url = self.endpoint("queue/")?;
+        url.path_segments_mut()
+            .map_err(|()| {
+                MineSkinClientError::Configuration(
+                    "MineSkin base URL cannot contain path segments".to_owned(),
+                )
             })?
-            .trim();
+            .pop_if_empty()
+            .push(job_id);
 
-        if raw_key.is_empty() {
-            return Err(MineSkinClientError::Configuration(
+        Ok(url)
+    }
+
+    fn authorize(&self, request: RequestBuilder) -> Result<RequestBuilder, MineSkinClientError> {
+        match &self.authorization {
+            AuthorizationHeader::Configured(header) => {
+                Ok(request.header(AUTHORIZATION, header.clone()))
+            }
+            AuthorizationHeader::Missing => Err(MineSkinClientError::Configuration(
+                "MineSkin API key is not configured".to_owned(),
+            )),
+            AuthorizationHeader::Empty => Err(MineSkinClientError::Configuration(
                 "MineSkin API key is empty".to_owned(),
-            ));
-        }
-
-        let authorization = if raw_key.starts_with("Bearer ") {
-            raw_key.to_owned()
-        } else {
-            format!("Bearer {raw_key}")
-        };
-        let header = HeaderValue::from_str(&authorization).map_err(|_| {
-            MineSkinClientError::Configuration(
+            )),
+            AuthorizationHeader::Invalid => Err(MineSkinClientError::Configuration(
                 "MineSkin API key contains invalid characters".to_owned(),
-            )
-        })?;
-
-        Ok(request.header(AUTHORIZATION, header))
+            )),
+        }
     }
 
     async fn execute(
         &self,
         request: RequestBuilder,
-    ) -> Result<(StatusCode, Value), MineSkinClientError> {
+        context: &'static str,
+    ) -> Result<MineSkinResponse, MineSkinClientError> {
         let response = request.send().await.map_err(MineSkinClientError::Request)?;
         let status = response.status();
-        let value = response
-            .json()
-            .await
-            .map_err(MineSkinClientError::Request)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAXIMUM_UPSTREAM_RESPONSE_SIZE as u64)
+        {
+            return Err(MineSkinClientError::unexpected(
+                context,
+                "response exceeded 1 MiB",
+            ));
+        }
 
-        Ok((status, value))
+        let capacity = response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(MAXIMUM_UPSTREAM_RESPONSE_SIZE)
+            .min(INITIAL_UPSTREAM_RESPONSE_CAPACITY);
+        let mut body = Vec::with_capacity(capacity);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(MineSkinClientError::Request)?;
+            if body.len().saturating_add(chunk.len()) > MAXIMUM_UPSTREAM_RESPONSE_SIZE {
+                return Err(MineSkinClientError::unexpected(
+                    context,
+                    "response exceeded 1 MiB",
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let buffered = BufferedResponse { status, body };
+        let response = parse_response(context, &buffered)?;
+
+        ensure_upstream_success(status, response)
     }
 }
 
@@ -292,18 +394,100 @@ pub struct UploadPayload {
     pub cape_uuid: String,
 }
 
-#[derive(Clone)]
 struct CachedCapes {
-    data: Vec<Cape>,
+    data: Arc<[Cape]>,
     fetched_at: Instant,
+}
+
+#[derive(Default)]
+struct CapeCache {
+    state: RwLock<CapeCacheState>,
+    refresh: Mutex<()>,
+}
+
+#[derive(Default)]
+struct CapeCacheState {
+    value: Option<Arc<CachedCapes>>,
+    last_failure: Option<CachedCapeFailure>,
+}
+
+#[derive(Clone)]
+struct CachedCapeFailure {
+    failed_at: Instant,
+    configuration_error: bool,
+    upstream_status: Option<StatusCode>,
+    message: String,
+}
+
+impl CachedCapeFailure {
+    fn new(error: &MineSkinClientError) -> Self {
+        Self {
+            failed_at: Instant::now(),
+            configuration_error: error.is_configuration_error(),
+            upstream_status: error.upstream_status(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_error(&self) -> MineSkinClientError {
+        if self.configuration_error {
+            return MineSkinClientError::Configuration(self.message.clone());
+        }
+        if let Some(status) = self.upstream_status {
+            return MineSkinClientError::upstream(status, self.message.clone());
+        }
+
+        MineSkinClientError::unexpected("MineSkin cape response", self.message.clone())
+    }
+}
+
+enum AuthorizationHeader {
+    Configured(HeaderValue),
+    Missing,
+    Empty,
+    Invalid,
+}
+
+impl AuthorizationHeader {
+    fn new(api_key: Option<&str>) -> Self {
+        let Some(raw_key) = api_key else {
+            return Self::Missing;
+        };
+        let raw_key = raw_key.trim();
+        if raw_key.is_empty() || raw_key.eq_ignore_ascii_case("Bearer") {
+            return Self::Empty;
+        }
+
+        let authorization = if raw_key.starts_with("Bearer ") {
+            raw_key.to_owned()
+        } else {
+            format!("Bearer {raw_key}")
+        };
+
+        HeaderValue::from_str(&authorization).map_or(Self::Invalid, |mut header| {
+            header.set_sensitive(true);
+            Self::Configured(header)
+        })
+    }
+}
+
+struct BufferedResponse {
+    status: StatusCode,
+    body: Vec<u8>,
 }
 
 fn parse_response<T: DeserializeOwned>(
     context: &'static str,
-    value: &Value,
+    response: &BufferedResponse,
 ) -> Result<T, MineSkinClientError> {
-    serde_json::from_value(value.clone()).map_err(|source| {
-        error!(context, response = %value, %source, "Failed to parse MineSkin response");
+    serde_json::from_slice(&response.body).map_err(|source| {
+        error!(
+            context,
+            status = %response.status,
+            response_size = response.body.len(),
+            %source,
+            "Failed to parse MineSkin response"
+        );
         MineSkinClientError::UnexpectedResponse {
             context,
             message: source.to_string(),
@@ -311,16 +495,12 @@ fn parse_response<T: DeserializeOwned>(
     })
 }
 
-fn generic_response(value: &Value) -> GenericResponse {
-    serde_json::from_value(value.clone()).unwrap_or_default()
-}
-
 fn ensure_upstream_success(
     status: StatusCode,
-    response: &GenericResponse,
-) -> Result<(), MineSkinClientError> {
+    response: MineSkinResponse,
+) -> Result<MineSkinResponse, MineSkinClientError> {
     if status.is_success() && response.success != Some(false) {
-        return Ok(());
+        return Ok(response);
     }
 
     let status = if status.is_success() {
@@ -330,7 +510,7 @@ fn ensure_upstream_success(
     };
     Err(MineSkinClientError::upstream(
         status,
-        response.error_message(),
+        response.into_error_message(),
     ))
 }
 
@@ -346,6 +526,12 @@ fn normalize_texture_url(value: &str) -> Result<String, MineSkinClientError> {
                 "cape URL scheme could not be normalized",
             )
         })?;
+    }
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(MineSkinClientError::unexpected(
+            "MineSkin cape response",
+            "cape URL must use HTTPS",
+        ));
     }
 
     Ok(url.to_string())
@@ -415,5 +601,77 @@ impl MineSkinClientError {
             self,
             Self::Configuration(_) | Self::Crypto(crate::crypto::CryptoError::MissingConfiguration)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, time::Duration};
+
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    use super::*;
+
+    const CAPE_UUID: &str = "123e4567-e89b-12d3-a456-426614174001";
+
+    type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+    #[tokio::test]
+    async fn serves_stale_capes_when_refresh_fails() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/capes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "capes": [{
+                    "uuid": CAPE_UUID,
+                    "alias": "founders",
+                    "url": "https://textures.example/cape.png",
+                    "supported": true
+                }]
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/capes"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "success": false,
+                "errors": [{ "message": "temporary failure" }]
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+        config.cape_cache_ttl = Duration::ZERO;
+        let client =
+            MineSkinClient::new(&config, UrlCipher::new(config.aes_secret_key.as_deref()))?;
+
+        let initial = client.supported_capes().await?;
+        let stale = client.supported_capes().await?;
+
+        assert!(Arc::ptr_eq(&initial, &stale));
+        server.verify().await;
+        Ok(())
+    }
+
+    #[test]
+    fn encodes_job_ids_as_single_path_segments() -> TestResult {
+        let config = AppConfig::for_tests(Url::parse("https://example.com/v2/")?);
+        let client =
+            MineSkinClient::new(&config, UrlCipher::new(config.aes_secret_key.as_deref()))?;
+
+        let url = client.job_endpoint("job/with?syntax")?;
+
+        assert_eq!(url.path(), "/v2/queue/job%2Fwith%3Fsyntax");
+        Ok(())
     }
 }
