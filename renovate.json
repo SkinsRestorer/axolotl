@@ -1,5 +1,6 @@
 {
-  "extends": ["config:base", "group:allNonMajor", ":semanticCommits"],
+  "extends": ["config:recommended", "group:allNonMajor", ":semanticCommits"],
+  "enabledManagers": ["cargo", "github-actions"],
   "packageRules": [
     {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],

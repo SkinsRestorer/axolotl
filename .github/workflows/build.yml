@@ -1,29 +1,33 @@
-name: 'Build and Test'
+name: Build and test
 
 on:
-  - push
-  - pull_request
+  push:
+  pull_request:
 
 jobs:
   test:
-    name: Build and Test
-
+    name: Build and test
     runs-on: ubuntu-24.04
+
     steps:
-      - name: 'Checkout repository'
+      - name: Checkout repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy,rustfmt
 
-      - name: Install dependencies
-        run: bun install
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: Run typecheck
-        run: |
-          bun typecheck
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Run check
-        run: |
-          bun run biome ci
+      - name: Run tests
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked

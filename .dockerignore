@@ -1,45 +1,8 @@
-# Eclipse stuff
-/.classpath
-/.project
-/.settings
-
-# NetBeans
-*/nbproject
-nb-configuration.xml
-
-# maven
-*/target
-
-# vim
-.*.sw[a-p]
-
-# virtual machine crash logs, see https://www.java.com/en/download/help/error_hotspot.xml
-hs_err_pid*
-
-# various other potential build files
-/bin
-/dist
-/manifest.mf
-
-# Mac filesystem dust
-.DS_Store
-
-# IntelliJ
-*.ipr
-*.iws
-.idea/
-
-# Gradle
-.gradle
-
-# Ignore Gradle GUI config
-gradle-app.setting
-
-# Avoid ignoring Gradle wrapper jar file (.jar files are usually ignored)
-!gradle-wrapper.jar
-
-**/build/
-**/run/
-out/
-
-temp/
+.git
+.github
+.env
+.env.*
+.idea
+.vscode
+target
+*.log

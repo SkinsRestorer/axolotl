@@ -1,0 +1,45 @@
+[package]
+name = "axolotl"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "MineSkin proxy service for SkinsRestorer"
+license = "GPL-3.0-only"
+repository = "https://github.com/SkinsRestorer/axolotl"
+
+[dependencies]
+aes = "0.9.1"
+axum = { version = "0.8.9", features = ["multipart"] }
+base64 = "0.22.1"
+cbc = { version = "0.2.1", features = ["alloc"] }
+dotenvy = "0.15.7"
+getrandom = { version = "0.4.3", features = ["std"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"] }
+utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = ["axum", "vendored"] }
+uuid = "1.24.0"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+wiremock = "0.6.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
