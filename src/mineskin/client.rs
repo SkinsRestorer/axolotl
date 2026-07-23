@@ -416,9 +416,4 @@ impl MineSkinClientError {
             Self::Configuration(_) | Self::Crypto(crate::crypto::CryptoError::MissingConfiguration)
         )
     }
-
-    #[must_use]
-    pub const fn is_invalid_upload(&self) -> bool {
-        matches!(self, Self::InvalidUpload(_))
-    }
 }

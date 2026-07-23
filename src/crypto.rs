@@ -66,8 +66,16 @@ impl UrlCipher {
     fn encrypt_uuid_with_iv(&self, uuid: &str, iv: [u8; 16]) -> Result<String, CryptoError> {
         let key = self.key()?;
         let plaintext = uuid.as_bytes();
-        let mut buffer = vec![0_u8; plaintext.len() + 16];
-        buffer[..plaintext.len()].copy_from_slice(plaintext);
+        let buffer_length = plaintext
+            .len()
+            .checked_add(16)
+            .ok_or(CryptoError::Encryption)?;
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(buffer_length)
+            .map_err(|_| CryptoError::Encryption)?;
+        buffer.extend_from_slice(plaintext);
+        buffer.resize(buffer_length, 0);
 
         let ciphertext = Aes256CbcEncryptor::new(key.into(), (&iv).into())
             .encrypt_padded::<Pkcs7>(&mut buffer, plaintext.len())

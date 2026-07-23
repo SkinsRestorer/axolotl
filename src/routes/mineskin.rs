@@ -351,29 +351,18 @@ fn validate_poll_interval(interval: Duration) -> Result<Duration, ApiError> {
 fn map_upload_error(error: &MineSkinClientError) -> ApiError {
     error!(%error, "MineSkin upload failed");
 
-    if error.is_configuration_error() {
-        return ApiError::internal(error.to_string());
-    }
-    if error.is_invalid_upload() {
-        return ApiError::bad_request(error.to_string());
-    }
-    if let Some(status) = error.upstream_status() {
-        return match status {
+    match error {
+        MineSkinClientError::Configuration(_) | MineSkinClientError::Crypto(_) => {
+            ApiError::internal(error.to_string())
+        }
+        MineSkinClientError::InvalidUpload(_) => ApiError::bad_request(error.to_string()),
+        MineSkinClientError::Upstream { status, .. } => match *status {
             StatusCode::BAD_REQUEST => ApiError::bad_request(error.to_string()),
             StatusCode::GATEWAY_TIMEOUT => {
                 ApiError::new(StatusCode::GATEWAY_TIMEOUT, error.to_string())
             }
             _ => ApiError::bad_gateway(error.to_string()),
-        };
-    }
-
-    match error {
-        MineSkinClientError::Crypto(_) => ApiError::internal(error.to_string()),
-        MineSkinClientError::Configuration(_)
-        | MineSkinClientError::InvalidUpload(_)
-        | MineSkinClientError::Upstream { .. } => {
-            unreachable!("handled above")
-        }
+        },
         MineSkinClientError::Request(_) | MineSkinClientError::UnexpectedResponse { .. } => {
             ApiError::bad_gateway(error.to_string())
         }

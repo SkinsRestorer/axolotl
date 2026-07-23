@@ -1,14 +1,27 @@
-use std::{error::Error, net::SocketAddr};
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
+use std::{error::Error, io, net::SocketAddr};
 
 use axolotl::{AppConfig, build_app};
 use tokio::{net::TcpListener, signal};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     dotenvy::dotenv().ok();
-    init_tracing();
+    init_tracing()?;
 
     let config = AppConfig::from_env()?;
     let address = SocketAddr::from(([0, 0, 0, 0], config.port()));
@@ -28,35 +41,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing() -> Result<(), Box<dyn Error + Send + Sync>> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("axolotl=info,tower_http=info"));
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .try_init()?;
+    Ok(())
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+    let result = tokio::select! {
+        result = signal::ctrl_c() => result,
+        result = terminate_signal() => result,
     };
 
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
+    match result {
+        Ok(()) => info!("Shutdown signal received"),
+        Err(error) => error!(%error, "Failed to listen for a shutdown signal"),
     }
+}
 
-    info!("Shutdown signal received");
+#[cfg(unix)]
+async fn terminate_signal() -> io::Result<()> {
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    terminate
+        .recv()
+        .await
+        .ok_or_else(|| io::Error::other("SIGTERM signal stream ended"))
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() -> io::Result<()> {
+    std::future::pending().await
 }
