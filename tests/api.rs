@@ -243,6 +243,60 @@ async fn rejects_non_https_cape_urls() -> TestResult {
 }
 
 #[tokio::test]
+async fn preserves_upload_rate_limits_and_cors_headers() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/capes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "capes": [{
+                "uuid": CAPE_UUID,
+                "alias": "founders",
+                "url": "https://textures.example/cape.png",
+                "supported": true
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/queue"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "success": false,
+            "errors": [{ "message": "rate limit exceeded (hour), 61 > 60" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+    let boundary = "axolotl-rate-limit-boundary";
+
+    let response = send(
+        &app,
+        Request::post("/mineskin/skins?waitMs=250")
+            .header(header::ORIGIN, "https://skinsrestorer.net")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_upload(boundary)))?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&header::HeaderValue::from_static("*"))
+    );
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "rate limit exceeded (hour), 61 > 60" })
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

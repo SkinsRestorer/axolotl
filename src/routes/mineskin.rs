@@ -90,6 +90,7 @@ pub struct DecryptedUrlResponse {
         (status = 200, description = "MineSkin job completed successfully.", body = SanitizedResponse),
         (status = 400, description = "Invalid request payload.", body = ErrorResponse),
         (status = 408, description = "The upload request exceeded its execution deadline.", body = ErrorResponse),
+        (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse),
         (status = 503, description = "The upload concurrency limit has been reached.", body = ErrorResponse),
@@ -152,6 +153,7 @@ pub async fn upload_skin(
     responses(
         (status = 200, description = "Job retrieved successfully.", body = SanitizedResponse),
         (status = 404, description = "Job could not be found.", body = ErrorResponse),
+        (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse)
     )
@@ -180,6 +182,7 @@ pub async fn job_status(
     description = "List MineSkin capes supported by the proxy.",
     responses(
         (status = 200, description = "List of supported capes.", body = CapesResponse),
+        (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse)
     )
@@ -203,6 +206,7 @@ pub async fn supported_capes(
     description = "Check whether the configured MineSkin account has cape grants and list supported capes.",
     responses(
         (status = 200, description = "Cape support information.", body = CapeSupportResponse),
+        (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse)
     )
@@ -370,6 +374,9 @@ fn map_upload_error(error: &MineSkinClientError) -> ApiError {
         MineSkinClientError::InvalidUpload(_) => ApiError::bad_request(error.to_string()),
         MineSkinClientError::Upstream { status, .. } => match *status {
             StatusCode::BAD_REQUEST => ApiError::bad_request(error.to_string()),
+            StatusCode::TOO_MANY_REQUESTS => {
+                ApiError::new(StatusCode::TOO_MANY_REQUESTS, error.to_string())
+            }
             StatusCode::GATEWAY_TIMEOUT => {
                 ApiError::new(StatusCode::GATEWAY_TIMEOUT, error.to_string())
             }
@@ -390,6 +397,9 @@ fn map_job_error(error: &MineSkinClientError) -> ApiError {
     if error.upstream_status() == Some(StatusCode::NOT_FOUND) {
         return ApiError::new(StatusCode::NOT_FOUND, error.to_string());
     }
+    if error.upstream_status() == Some(StatusCode::TOO_MANY_REQUESTS) {
+        return ApiError::new(StatusCode::TOO_MANY_REQUESTS, error.to_string());
+    }
 
     ApiError::bad_gateway(error.to_string())
 }
@@ -399,6 +409,8 @@ fn map_proxy_error(error: &MineSkinClientError) -> ApiError {
 
     if error.is_configuration_error() {
         ApiError::internal(error.to_string())
+    } else if error.upstream_status() == Some(StatusCode::TOO_MANY_REQUESTS) {
+        ApiError::new(StatusCode::TOO_MANY_REQUESTS, error.to_string())
     } else {
         ApiError::bad_gateway(error.to_string())
     }
