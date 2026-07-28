@@ -46,7 +46,7 @@ pub struct Metrics {
     mineskin_latency: LatencyHistogram,
     upload: EndpointMetrics,
     decrypt: EndpointMetrics,
-    client_requests: Mutex<HashMap<IpAddr, u64>>,
+    client_requests: Mutex<ClientRequestWindows>,
     started_at: Instant,
 }
 
@@ -71,7 +71,7 @@ impl Default for Metrics {
             mineskin_latency: LatencyHistogram::default(),
             upload: EndpointMetrics::default(),
             decrypt: EndpointMetrics::default(),
-            client_requests: Mutex::new(HashMap::new()),
+            client_requests: Mutex::new(ClientRequestWindows::default()),
             started_at: Instant::now(),
         }
     }
@@ -106,12 +106,18 @@ impl Metrics {
 
         self.record_endpoint(path, status, latency);
 
-        if let Some(count) = client_ip.and_then(|client_ip| client_requests.get_mut(&client_ip)) {
-            *count = count.saturating_add(1);
-        } else if let Some(client_ip) =
-            client_ip.filter(|_| client_requests.len() < MAX_TRACKED_CLIENTS)
+        if let Some(client_ip) =
+            client_ip.filter(|client_ip| record_client(&mut client_requests.all, *client_ip))
         {
-            client_requests.insert(client_ip, 1);
+            match path {
+                "/mineskin/skins" => {
+                    increment_client(&mut client_requests.upload, client_ip);
+                }
+                "/mineskin/decrypt-url" => {
+                    increment_client(&mut client_requests.decrypt, client_ip);
+                }
+                _ => {}
+            }
         } else {
             self.unattributed_requests.fetch_add(1, Ordering::Relaxed);
         }
@@ -156,9 +162,9 @@ impl Metrics {
             bytes_received_from_mineskin: self.bytes_received_from_mineskin.load(Ordering::Relaxed),
             request_latency: self.request_latency.snapshot(),
             mineskin_latency: self.mineskin_latency.snapshot(),
-            upload: self.upload.snapshot(),
-            decrypt: self.decrypt.snapshot(),
-            client_requests: client_requests.clone(),
+            upload: self.upload.snapshot(client_requests.upload.clone()),
+            decrypt: self.decrypt.snapshot(client_requests.decrypt.clone()),
+            client_requests: client_requests.all.clone(),
             uptime: self.started_at.elapsed(),
             report_period: Duration::ZERO,
         }
@@ -166,15 +172,12 @@ impl Metrics {
 
     pub fn acknowledge_client_requests(&self, snapshot: &MetricsSnapshot) {
         let mut requests = self.lock_client_requests();
-        for (client_ip, acknowledged) in &snapshot.client_requests {
-            if let Some(current) = requests.get_mut(client_ip) {
-                *current = current.saturating_sub(*acknowledged);
-            }
-        }
-        requests.retain(|_, count| *count > 0);
+        acknowledge_clients(&mut requests.all, &snapshot.client_requests);
+        acknowledge_clients(&mut requests.upload, &snapshot.upload.client_requests);
+        acknowledge_clients(&mut requests.decrypt, &snapshot.decrypt.client_requests);
     }
 
-    fn lock_client_requests(&self) -> MutexGuard<'_, HashMap<IpAddr, u64>> {
+    fn lock_client_requests(&self) -> MutexGuard<'_, ClientRequestWindows> {
         self.client_requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -198,6 +201,43 @@ impl Metrics {
             }
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct ClientRequestWindows {
+    all: HashMap<IpAddr, u64>,
+    upload: HashMap<IpAddr, u64>,
+    decrypt: HashMap<IpAddr, u64>,
+}
+
+fn record_client(requests: &mut HashMap<IpAddr, u64>, client_ip: IpAddr) -> bool {
+    if let Some(count) = requests.get_mut(&client_ip) {
+        *count = count.saturating_add(1);
+        return true;
+    }
+    if requests.len() >= MAX_TRACKED_CLIENTS {
+        return false;
+    }
+
+    requests.insert(client_ip, 1);
+    true
+}
+
+fn increment_client(requests: &mut HashMap<IpAddr, u64>, client_ip: IpAddr) {
+    let count = requests.entry(client_ip).or_default();
+    *count = count.saturating_add(1);
+}
+
+fn acknowledge_clients(
+    requests: &mut HashMap<IpAddr, u64>,
+    acknowledged_requests: &HashMap<IpAddr, u64>,
+) {
+    for (client_ip, acknowledged) in acknowledged_requests {
+        if let Some(current) = requests.get_mut(client_ip) {
+            *current = current.saturating_sub(*acknowledged);
+        }
+    }
+    requests.retain(|_, count| *count > 0);
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -272,6 +312,7 @@ pub(crate) struct EndpointSnapshot {
     pub(crate) client_errors: u64,
     pub(crate) server_errors: u64,
     pub(crate) latency: LatencySnapshot,
+    pub(crate) client_requests: HashMap<IpAddr, u64>,
 }
 
 impl EndpointSnapshot {
@@ -284,6 +325,7 @@ impl EndpointSnapshot {
             client_errors: self.client_errors.saturating_sub(previous.client_errors),
             server_errors: self.server_errors.saturating_sub(previous.server_errors),
             latency: self.latency.since(&previous.latency),
+            client_requests: self.client_requests.clone(),
         }
     }
 }
@@ -382,13 +424,14 @@ impl EndpointMetrics {
         }
     }
 
-    fn snapshot(&self) -> EndpointSnapshot {
+    fn snapshot(&self, client_requests: HashMap<IpAddr, u64>) -> EndpointSnapshot {
         EndpointSnapshot {
             requests: self.requests.load(Ordering::Relaxed),
             successful_responses: self.successful_responses.load(Ordering::Relaxed),
             client_errors: self.client_errors.load(Ordering::Relaxed),
             server_errors: self.server_errors.load(Ordering::Relaxed),
             latency: self.latency.snapshot(),
+            client_requests,
         }
     }
 }
@@ -467,16 +510,15 @@ mod tests {
             Some(client),
             Duration::from_millis(70),
         );
-        metrics.acknowledge_client_requests(&reported);
-
         let current = metrics.snapshot();
         let window = current.since(&baseline, Duration::from_mins(5));
-        assert_eq!(current.client_requests.get(&client), Some(&2));
         assert_eq!(window.requests, 3);
         assert_eq!(window.upload.requests, 1);
         assert_eq!(window.upload.successful_responses, 1);
+        assert_eq!(window.upload.client_requests.get(&client), Some(&1));
         assert_eq!(window.decrypt.requests, 1);
         assert_eq!(window.decrypt.client_errors, 1);
+        assert_eq!(window.decrypt.client_requests.get(&client), Some(&1));
         assert_eq!(window.job_requests, 1);
         assert_eq!(window.server_errors, 1);
         assert_eq!(window.client_errors, 1);
@@ -487,6 +529,20 @@ mod tests {
         assert_eq!(
             window.request_latency.percentile(95),
             Duration::from_secs(1)
+        );
+
+        metrics.acknowledge_client_requests(&reported);
+        let after_acknowledgement = metrics.snapshot();
+        assert_eq!(after_acknowledgement.client_requests.get(&client), Some(&2));
+        assert!(
+            !after_acknowledgement
+                .upload
+                .client_requests
+                .contains_key(&client)
+        );
+        assert_eq!(
+            after_acknowledgement.decrypt.client_requests.get(&client),
+            Some(&1)
         );
     }
 }

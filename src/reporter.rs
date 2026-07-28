@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     fs,
+    net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -134,12 +136,12 @@ fn build_report(snapshot: &MetricsSnapshot) -> serde_json::Value {
                 {
                     "name": format!("Uploads ({report_period})"),
                     "value": format_endpoint_stats(&snapshot.upload),
-                    "inline": true
+                    "inline": false
                 },
                 {
                     "name": format!("Decryptions ({report_period})"),
                     "value": format_endpoint_stats(&snapshot.decrypt),
-                    "inline": true
+                    "inline": false
                 },
                 {
                     "name": format!("Other Endpoints ({report_period})"),
@@ -206,15 +208,27 @@ fn format_endpoint_stats(snapshot: &EndpointSnapshot) -> String {
         .client_errors
         .saturating_add(snapshot.server_errors);
     let error_percentage = percentage(errors, snapshot.requests);
+    let client_insight = ClientInsight::from_requests(&snapshot.client_requests);
     format!(
-        "**Requests:** {}\n**Successful:** {}\n**4xx:** {}\n**5xx:** {}\n**Error rate:** {error_percentage:.1}%\n**Latency:** {} avg / {} p50 / {} p95",
+        "**Requests:** {}\n**Successful:** {}\n**4xx:** {}\n**5xx:** {}\n**Error rate:** {error_percentage:.1}%\n**Latency:** {} avg / {} p50 / {} p95\n**Pattern:** {}\n**Unique IPs:** {}\n**Attributed:** {} / {}\n**One-request IPs:** {} ({:.1}%)\n**Top IP:** {} req ({:.1}%)\n**Top 5 IPs:** {} req ({:.1}%)\n**Avg/IP:** {:.1}",
         format_number(snapshot.requests),
         format_number(snapshot.successful_responses),
         format_number(snapshot.client_errors),
         format_number(snapshot.server_errors),
         format_latency(snapshot.latency.average()),
         format_latency(snapshot.latency.percentile(50)),
-        format_latency(snapshot.latency.percentile(95))
+        format_latency(snapshot.latency.percentile(95)),
+        client_insight.pattern,
+        format_number(client_insight.unique_clients),
+        format_number(client_insight.attributed_requests),
+        format_number(snapshot.requests),
+        format_number(client_insight.one_request_clients),
+        client_insight.one_request_client_percentage,
+        format_number(client_insight.top_client_requests),
+        client_insight.top_client_percentage,
+        format_number(client_insight.top_five_requests),
+        client_insight.top_five_percentage,
+        client_insight.average_requests_per_client
     )
 }
 
@@ -276,11 +290,12 @@ struct ClientInsight {
 impl ClientInsight {
     #[allow(clippy::cast_precision_loss)]
     fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
-        let mut request_counts = snapshot
-            .client_requests
-            .values()
-            .copied()
-            .collect::<Vec<_>>();
+        Self::from_requests(&snapshot.client_requests)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn from_requests(requests: &HashMap<IpAddr, u64>) -> Self {
+        let mut request_counts = requests.values().copied().collect::<Vec<_>>();
         request_counts.sort_unstable_by(|left, right| right.cmp(left));
 
         let unique_clients = u64::try_from(request_counts.len()).unwrap_or(u64::MAX);
