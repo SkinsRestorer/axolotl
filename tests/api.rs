@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, error::Error, io, time::Duration};
 
-use axolotl::{AppConfig, api_document, build_app};
+use axolotl::{AppConfig, Metrics, api_document, build_app};
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -494,7 +494,7 @@ fn openapi_document_exposes_the_complete_public_surface() -> TestResult {
 
 fn test_app(base_url: &str) -> TestResult<Router> {
     let config = AppConfig::for_tests(Url::parse(base_url)?);
-    Ok(build_app(&config)?)
+    Ok(build_app(&config, std::sync::Arc::new(Metrics::default()))?)
 }
 
 async fn send(app: &Router, request: Request<Body>) -> TestResult<Response<Body>> {

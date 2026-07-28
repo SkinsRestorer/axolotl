@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub(crate) mineskin_base_url: Url,
     pub(crate) mineskin_api_key: Option<String>,
     pub(crate) aes_secret_key: Option<String>,
+    pub(crate) discord_webhook: Option<Url>,
     pub(crate) request_timeout: Duration,
     pub(crate) default_poll_interval: Duration,
     pub(crate) max_poll_duration: Duration,
@@ -30,8 +31,8 @@ impl AppConfig {
     /// # Errors
     ///
     /// Returns an error when an environment variable is not valid Unicode, when
-    /// `PORT` is not a valid TCP port, or when the built-in `MineSkin` URL
-    /// cannot be parsed.
+    /// `PORT` is not a valid TCP port, or when an application URL cannot be
+    /// parsed.
     pub fn from_env() -> Result<Self, ConfigError> {
         let port = match env::var("PORT") {
             Ok(value) => parse_port(&value)?,
@@ -45,6 +46,10 @@ impl AppConfig {
                 .map_err(ConfigError::InvalidBaseUrl)?,
             mineskin_api_key: optional_environment_value("MINESKIN_API_KEY")?,
             aes_secret_key: optional_environment_value("AES_SECRET_KEY")?,
+            discord_webhook: optional_environment_value("DISCORD_WEBHOOK")?
+                .map(|value| Url::parse(&value))
+                .transpose()
+                .map_err(ConfigError::InvalidDiscordWebhook)?,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             default_poll_interval: DEFAULT_POLL_INTERVAL,
             max_poll_duration: DEFAULT_MAX_POLL_DURATION,
@@ -58,6 +63,11 @@ impl AppConfig {
         self.port
     }
 
+    #[must_use]
+    pub const fn discord_webhook(&self) -> Option<&Url> {
+        self.discord_webhook.as_ref()
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests(mineskin_base_url: Url) -> Self {
@@ -66,6 +76,7 @@ impl AppConfig {
             mineskin_base_url,
             mineskin_api_key: Some("test-api-key".to_owned()),
             aes_secret_key: Some("test-secret".to_owned()),
+            discord_webhook: None,
             request_timeout: Duration::from_secs(2),
             default_poll_interval: Duration::from_millis(1),
             max_poll_duration: Duration::from_secs(1),
@@ -102,4 +113,6 @@ pub enum ConfigError {
     Environment(#[source] env::VarError),
     #[error("the configured MineSkin base URL is invalid")]
     InvalidBaseUrl(#[source] url::ParseError),
+    #[error("DISCORD_WEBHOOK must be a valid URL")]
+    InvalidDiscordWebhook(#[source] url::ParseError),
 }

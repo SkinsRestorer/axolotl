@@ -11,9 +11,9 @@
     )
 )]
 
-use std::{error::Error, io, net::SocketAddr};
+use std::{error::Error, io, net::SocketAddr, sync::Arc};
 
-use axolotl::{AppConfig, build_app};
+use axolotl::{AppConfig, Metrics, build_app, reporter::DiscordReporter};
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -26,9 +26,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config = AppConfig::from_env()?;
     let port = config.port();
     let address = SocketAddr::from(([0, 0, 0, 0], port));
-    let app = build_app(&config)?;
-    drop(config);
+    let metrics = Arc::new(Metrics::default());
+    let app = build_app(&config, Arc::clone(&metrics))?;
     let listener = TcpListener::bind(address).await?;
+    let reporter = DiscordReporter::start(config.discord_webhook().cloned(), metrics);
+    drop(config);
 
     info!(%address, "Axolotl server started");
     info!(
@@ -36,9 +38,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "API documentation available"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let server_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
+    reporter.shutdown().await;
+    server_result?;
 
     Ok(())
 }

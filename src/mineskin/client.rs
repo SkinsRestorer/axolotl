@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     crypto::{MINESKIN_URL_PREFIX, UrlCipher},
+    metrics::Metrics,
 };
 
 use super::models::{
@@ -40,6 +41,7 @@ pub struct MineSkinClient {
     base_url: Url,
     authorization: AuthorizationHeader,
     cipher: UrlCipher,
+    metrics: Arc<Metrics>,
     cache: CapeCache,
     default_poll_interval: Duration,
     max_poll_duration: Duration,
@@ -47,7 +49,11 @@ pub struct MineSkinClient {
 }
 
 impl MineSkinClient {
-    pub fn new(config: &AppConfig, cipher: UrlCipher) -> Result<Self, MineSkinClientError> {
+    pub fn new(
+        config: &AppConfig,
+        cipher: UrlCipher,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, MineSkinClientError> {
         let http = Client::builder()
             .user_agent(MINESKIN_USER_AGENT)
             .timeout(config.request_timeout)
@@ -59,6 +65,7 @@ impl MineSkinClient {
             base_url: config.mineskin_base_url.clone(),
             authorization: AuthorizationHeader::new(config.mineskin_api_key.as_deref()),
             cipher,
+            metrics,
             cache: CapeCache::default(),
             default_poll_interval: config.default_poll_interval,
             max_poll_duration: config.max_poll_duration,
@@ -346,41 +353,55 @@ impl MineSkinClient {
         request: RequestBuilder,
         context: &'static str,
     ) -> Result<MineSkinResponse, MineSkinClientError> {
-        let response = request.send().await.map_err(MineSkinClientError::Request)?;
-        let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAXIMUM_UPSTREAM_RESPONSE_SIZE as u64)
-        {
-            return Err(MineSkinClientError::unexpected(
-                context,
-                "response exceeded 1 MiB",
-            ));
-        }
-
-        let capacity = response
-            .content_length()
-            .and_then(|length| usize::try_from(length).ok())
-            .unwrap_or_default()
-            .min(MAXIMUM_UPSTREAM_RESPONSE_SIZE)
-            .min(INITIAL_UPSTREAM_RESPONSE_CAPACITY);
-        let mut body = Vec::with_capacity(capacity);
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(MineSkinClientError::Request)?;
-            if body.len().saturating_add(chunk.len()) > MAXIMUM_UPSTREAM_RESPONSE_SIZE {
+        self.metrics.begin_mineskin_request();
+        let started_at = Instant::now();
+        let result = async {
+            let response = request.send().await.map_err(MineSkinClientError::Request)?;
+            let status = response.status();
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAXIMUM_UPSTREAM_RESPONSE_SIZE as u64)
+            {
                 return Err(MineSkinClientError::unexpected(
                     context,
                     "response exceeded 1 MiB",
                 ));
             }
-            body.extend_from_slice(&chunk);
+
+            let capacity = response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(MAXIMUM_UPSTREAM_RESPONSE_SIZE)
+                .min(INITIAL_UPSTREAM_RESPONSE_CAPACITY);
+            let mut body = Vec::with_capacity(capacity);
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(MineSkinClientError::Request)?;
+                if body.len().saturating_add(chunk.len()) > MAXIMUM_UPSTREAM_RESPONSE_SIZE {
+                    return Err(MineSkinClientError::unexpected(
+                        context,
+                        "response exceeded 1 MiB",
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+
+            self.metrics.record_mineskin_response_bytes(body.len());
+            let buffered = BufferedResponse { status, body };
+            let response = parse_response(context, &buffered)?;
+
+            ensure_upstream_success(status, response)
         }
-
-        let buffered = BufferedResponse { status, body };
-        let response = parse_response(context, &buffered)?;
-
-        ensure_upstream_success(status, response)
+        .await;
+        let rate_limited = result
+            .as_ref()
+            .err()
+            .and_then(MineSkinClientError::upstream_status)
+            == Some(StatusCode::TOO_MANY_REQUESTS);
+        self.metrics
+            .finish_mineskin_request(started_at.elapsed(), result.is_err(), rate_limited);
+        result
     }
 }
 
@@ -652,8 +673,11 @@ mod tests {
 
         let mut config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
         config.cape_cache_ttl = Duration::ZERO;
-        let client =
-            MineSkinClient::new(&config, UrlCipher::new(config.aes_secret_key.as_deref()))?;
+        let client = MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?;
 
         let initial = client.supported_capes().await?;
         let stale = client.supported_capes().await?;
@@ -666,8 +690,11 @@ mod tests {
     #[test]
     fn encodes_job_ids_as_single_path_segments() -> TestResult {
         let config = AppConfig::for_tests(Url::parse("https://example.com/v2/")?);
-        let client =
-            MineSkinClient::new(&config, UrlCipher::new(config.aes_secret_key.as_deref()))?;
+        let client = MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?;
 
         let url = client.job_endpoint("job/with?syntax")?;
 
