@@ -33,10 +33,8 @@ pub struct Metrics {
     redirects: AtomicU64,
     client_errors: AtomicU64,
     server_errors: AtomicU64,
-    upload_requests: AtomicU64,
     job_requests: AtomicU64,
     cape_requests: AtomicU64,
-    decrypt_requests: AtomicU64,
     health_requests: AtomicU64,
     other_requests: AtomicU64,
     unattributed_requests: AtomicU64,
@@ -46,6 +44,8 @@ pub struct Metrics {
     bytes_received_from_mineskin: AtomicU64,
     request_latency: LatencyHistogram,
     mineskin_latency: LatencyHistogram,
+    upload: EndpointMetrics,
+    decrypt: EndpointMetrics,
     client_requests: Mutex<HashMap<IpAddr, u64>>,
     started_at: Instant,
 }
@@ -58,10 +58,8 @@ impl Default for Metrics {
             redirects: AtomicU64::new(0),
             client_errors: AtomicU64::new(0),
             server_errors: AtomicU64::new(0),
-            upload_requests: AtomicU64::new(0),
             job_requests: AtomicU64::new(0),
             cape_requests: AtomicU64::new(0),
-            decrypt_requests: AtomicU64::new(0),
             health_requests: AtomicU64::new(0),
             other_requests: AtomicU64::new(0),
             unattributed_requests: AtomicU64::new(0),
@@ -71,6 +69,8 @@ impl Default for Metrics {
             bytes_received_from_mineskin: AtomicU64::new(0),
             request_latency: LatencyHistogram::default(),
             mineskin_latency: LatencyHistogram::default(),
+            upload: EndpointMetrics::default(),
+            decrypt: EndpointMetrics::default(),
             client_requests: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
         }
@@ -104,7 +104,7 @@ impl Metrics {
             }
         }
 
-        request_counter(path, self).fetch_add(1, Ordering::Relaxed);
+        self.record_endpoint(path, status, latency);
 
         if let Some(count) = client_ip.and_then(|client_ip| client_requests.get_mut(&client_ip)) {
             *count = count.saturating_add(1);
@@ -145,10 +145,8 @@ impl Metrics {
             redirects: self.redirects.load(Ordering::Relaxed),
             client_errors: self.client_errors.load(Ordering::Relaxed),
             server_errors: self.server_errors.load(Ordering::Relaxed),
-            upload_requests: self.upload_requests.load(Ordering::Relaxed),
             job_requests: self.job_requests.load(Ordering::Relaxed),
             cape_requests: self.cape_requests.load(Ordering::Relaxed),
-            decrypt_requests: self.decrypt_requests.load(Ordering::Relaxed),
             health_requests: self.health_requests.load(Ordering::Relaxed),
             other_requests: self.other_requests.load(Ordering::Relaxed),
             unattributed_requests: self.unattributed_requests.load(Ordering::Relaxed),
@@ -158,6 +156,8 @@ impl Metrics {
             bytes_received_from_mineskin: self.bytes_received_from_mineskin.load(Ordering::Relaxed),
             request_latency: self.request_latency.snapshot(),
             mineskin_latency: self.mineskin_latency.snapshot(),
+            upload: self.upload.snapshot(),
+            decrypt: self.decrypt.snapshot(),
             client_requests: client_requests.clone(),
             uptime: self.started_at.elapsed(),
             report_period: Duration::ZERO,
@@ -179,16 +179,24 @@ impl Metrics {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
-}
 
-fn request_counter<'a>(path: &str, metrics: &'a Metrics) -> &'a AtomicU64 {
-    match path {
-        "/mineskin/skins" => &metrics.upload_requests,
-        "/mineskin/capes" | "/mineskin/cape-support" => &metrics.cape_requests,
-        "/mineskin/decrypt-url" => &metrics.decrypt_requests,
-        "/health" => &metrics.health_requests,
-        _ if path.starts_with("/mineskin/jobs/") => &metrics.job_requests,
-        _ => &metrics.other_requests,
+    fn record_endpoint(&self, path: &str, status: u16, latency: Duration) {
+        match path {
+            "/mineskin/skins" => self.upload.record(status, latency),
+            "/mineskin/decrypt-url" => self.decrypt.record(status, latency),
+            "/mineskin/capes" | "/mineskin/cape-support" => {
+                self.cape_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            "/health" => {
+                self.health_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            _ if path.starts_with("/mineskin/jobs/") => {
+                self.job_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.other_requests.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -258,16 +266,37 @@ impl LatencySnapshot {
 }
 
 #[derive(Debug, Clone, Default)]
+pub(crate) struct EndpointSnapshot {
+    pub(crate) requests: u64,
+    pub(crate) successful_responses: u64,
+    pub(crate) client_errors: u64,
+    pub(crate) server_errors: u64,
+    pub(crate) latency: LatencySnapshot,
+}
+
+impl EndpointSnapshot {
+    fn since(&self, previous: &Self) -> Self {
+        Self {
+            requests: self.requests.saturating_sub(previous.requests),
+            successful_responses: self
+                .successful_responses
+                .saturating_sub(previous.successful_responses),
+            client_errors: self.client_errors.saturating_sub(previous.client_errors),
+            server_errors: self.server_errors.saturating_sub(previous.server_errors),
+            latency: self.latency.since(&previous.latency),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     pub(crate) requests: u64,
     pub(crate) successful_responses: u64,
     pub(crate) redirects: u64,
     pub(crate) client_errors: u64,
     pub(crate) server_errors: u64,
-    pub(crate) upload_requests: u64,
     pub(crate) job_requests: u64,
     pub(crate) cape_requests: u64,
-    pub(crate) decrypt_requests: u64,
     pub(crate) health_requests: u64,
     pub(crate) other_requests: u64,
     pub(crate) unattributed_requests: u64,
@@ -277,6 +306,8 @@ pub struct MetricsSnapshot {
     pub(crate) bytes_received_from_mineskin: u64,
     pub(crate) request_latency: LatencySnapshot,
     pub(crate) mineskin_latency: LatencySnapshot,
+    pub(crate) upload: EndpointSnapshot,
+    pub(crate) decrypt: EndpointSnapshot,
     pub(crate) client_requests: HashMap<IpAddr, u64>,
     pub(crate) uptime: Duration,
     pub(crate) report_period: Duration,
@@ -293,14 +324,8 @@ impl MetricsSnapshot {
             redirects: self.redirects.saturating_sub(previous.redirects),
             client_errors: self.client_errors.saturating_sub(previous.client_errors),
             server_errors: self.server_errors.saturating_sub(previous.server_errors),
-            upload_requests: self
-                .upload_requests
-                .saturating_sub(previous.upload_requests),
             job_requests: self.job_requests.saturating_sub(previous.job_requests),
             cape_requests: self.cape_requests.saturating_sub(previous.cape_requests),
-            decrypt_requests: self
-                .decrypt_requests
-                .saturating_sub(previous.decrypt_requests),
             health_requests: self
                 .health_requests
                 .saturating_sub(previous.health_requests),
@@ -322,9 +347,48 @@ impl MetricsSnapshot {
                 .saturating_sub(previous.bytes_received_from_mineskin),
             request_latency: self.request_latency.since(&previous.request_latency),
             mineskin_latency: self.mineskin_latency.since(&previous.mineskin_latency),
+            upload: self.upload.since(&previous.upload),
+            decrypt: self.decrypt.since(&previous.decrypt),
             client_requests: self.client_requests.clone(),
             uptime: self.uptime,
             report_period,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct EndpointMetrics {
+    requests: AtomicU64,
+    successful_responses: AtomicU64,
+    client_errors: AtomicU64,
+    server_errors: AtomicU64,
+    latency: LatencyHistogram,
+}
+
+impl EndpointMetrics {
+    fn record(&self, status: u16, latency: Duration) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.latency.record(latency);
+        match status {
+            200..=399 => {
+                self.successful_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            400..=499 => {
+                self.client_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.server_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> EndpointSnapshot {
+        EndpointSnapshot {
+            requests: self.requests.load(Ordering::Relaxed),
+            successful_responses: self.successful_responses.load(Ordering::Relaxed),
+            client_errors: self.client_errors.load(Ordering::Relaxed),
+            server_errors: self.server_errors.load(Ordering::Relaxed),
+            latency: self.latency.snapshot(),
         }
     }
 }
@@ -397,17 +461,27 @@ mod tests {
             Some(client),
             Duration::from_millis(600),
         );
+        metrics.record_request(
+            "/mineskin/decrypt-url",
+            400,
+            Some(client),
+            Duration::from_millis(70),
+        );
         metrics.acknowledge_client_requests(&reported);
 
         let current = metrics.snapshot();
         let window = current.since(&baseline, Duration::from_mins(5));
-        assert_eq!(current.client_requests.get(&client), Some(&1));
-        assert_eq!(window.requests, 2);
-        assert_eq!(window.upload_requests, 1);
+        assert_eq!(current.client_requests.get(&client), Some(&2));
+        assert_eq!(window.requests, 3);
+        assert_eq!(window.upload.requests, 1);
+        assert_eq!(window.upload.successful_responses, 1);
+        assert_eq!(window.decrypt.requests, 1);
+        assert_eq!(window.decrypt.client_errors, 1);
         assert_eq!(window.job_requests, 1);
         assert_eq!(window.server_errors, 1);
+        assert_eq!(window.client_errors, 1);
         assert_eq!(
-            window.request_latency.percentile(50),
+            window.upload.latency.percentile(95),
             Duration::from_millis(25)
         );
         assert_eq!(

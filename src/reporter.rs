@@ -13,7 +13,7 @@ use tokio::{
 };
 use tracing::{error, info};
 
-use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::metrics::{EndpointSnapshot, Metrics, MetricsSnapshot};
 
 const REPORT_INTERVAL: Duration = Duration::from_mins(5);
 
@@ -114,96 +114,46 @@ async fn send_report(
 
 fn build_report(snapshot: &MetricsSnapshot) -> serde_json::Value {
     let client_insight = ClientInsight::from_snapshot(snapshot);
-    let color = match snapshot
-        .server_errors
-        .saturating_add(snapshot.mineskin_errors)
-    {
-        0 => 0x002e_cc71,
-        1..=5 => 0x00f3_9c12,
-        _ => 0x00e7_4c3c,
-    };
-    let rss = process_rss_bytes().map_or_else(|| "Unavailable".to_owned(), format_bytes);
-    let load_average = load_average().unwrap_or_else(|| "Unavailable".to_owned());
     let report_period = format_report_period(snapshot.report_period);
-    let attributed_requests = client_insight.attributed_requests;
-    let response_errors = snapshot
-        .client_errors
-        .saturating_add(snapshot.server_errors);
-    let response_error_percentage = percentage(response_errors, snapshot.requests);
-    let mineskin_error_percentage =
-        percentage(snapshot.mineskin_errors, snapshot.mineskin_requests);
 
     json!({
         "embeds": [{
             "title": "Axolotl - Status Report",
-            "color": color,
+            "color": report_color(snapshot),
             "fields": [
                 {
                     "name": "Server",
-                    "value": format!(
-                        "**Uptime:** {}\n**RSS:** {rss}\n**Load Avg:** {load_average}",
-                        format_duration(snapshot.uptime)
-                    ),
+                    "value": server_stats(snapshot),
                     "inline": false
                 },
                 {
                     "name": format!("Traffic ({report_period})"),
-                    "value": format!(
-                        "**Requests:** {}\n**Successful:** {}\n**Redirects:** {}\n**4xx:** {}\n**5xx:** {}\n**Error rate:** {response_error_percentage:.1}%\n**Latency:** {} avg / {} p50 / {} p95",
-                        format_number(snapshot.requests),
-                        format_number(snapshot.successful_responses),
-                        format_number(snapshot.redirects),
-                        format_number(snapshot.client_errors),
-                        format_number(snapshot.server_errors),
-                        format_latency(snapshot.request_latency.average()),
-                        format_latency(snapshot.request_latency.percentile(50)),
-                        format_latency(snapshot.request_latency.percentile(95))
-                    ),
+                    "value": traffic_stats(snapshot),
                     "inline": false
                 },
                 {
-                    "name": format!("Endpoints ({report_period})"),
-                    "value": format!(
-                        "**Uploads:** {}\n**Jobs:** {}\n**Cape:** {}\n**Decrypt:** {}\n**Health:** {}\n**Docs / Other:** {}",
-                        format_number(snapshot.upload_requests),
-                        format_number(snapshot.job_requests),
-                        format_number(snapshot.cape_requests),
-                        format_number(snapshot.decrypt_requests),
-                        format_number(snapshot.health_requests),
-                        format_number(snapshot.other_requests)
-                    ),
+                    "name": format!("Uploads ({report_period})"),
+                    "value": format_endpoint_stats(&snapshot.upload),
+                    "inline": true
+                },
+                {
+                    "name": format!("Decryptions ({report_period})"),
+                    "value": format_endpoint_stats(&snapshot.decrypt),
+                    "inline": true
+                },
+                {
+                    "name": format!("Other Endpoints ({report_period})"),
+                    "value": other_endpoint_stats(snapshot),
                     "inline": true
                 },
                 {
                     "name": format!("Clients ({report_period})"),
-                    "value": format!(
-                        "**Pattern:** {}\n**Unique IPs:** {}\n**Attributed:** {} / {}\n**One-request IPs:** {} ({:.1}%)\n**Top IP:** {} req ({:.1}%)\n**Top 5 IPs:** {} req ({:.1}%)\n**Avg/IP:** {:.1}",
-                        client_insight.pattern,
-                        format_number(client_insight.unique_clients),
-                        format_number(attributed_requests),
-                        format_number(snapshot.requests),
-                        format_number(client_insight.one_request_clients),
-                        client_insight.one_request_client_percentage,
-                        format_number(client_insight.top_client_requests),
-                        client_insight.top_client_percentage,
-                        format_number(client_insight.top_five_requests),
-                        client_insight.top_five_percentage,
-                        client_insight.average_requests_per_client
-                    ),
+                    "value": client_stats(snapshot, &client_insight),
                     "inline": true
                 },
                 {
                     "name": format!("MineSkin ({report_period})"),
-                    "value": format!(
-                        "**Requests:** {}\n**Errors:** {} ({mineskin_error_percentage:.1}%)\n**Rate limits:** {}\n**Received:** {}\n**Latency:** {} avg / {} p50 / {} p95",
-                        format_number(snapshot.mineskin_requests),
-                        format_number(snapshot.mineskin_errors),
-                        format_number(snapshot.mineskin_rate_limits),
-                        format_bytes(snapshot.bytes_received_from_mineskin),
-                        format_latency(snapshot.mineskin_latency.average()),
-                        format_latency(snapshot.mineskin_latency.percentile(50)),
-                        format_latency(snapshot.mineskin_latency.percentile(95))
-                    ),
+                    "value": mineskin_stats(snapshot),
                     "inline": false
                 }
             ],
@@ -211,6 +161,102 @@ fn build_report(snapshot: &MetricsSnapshot) -> serde_json::Value {
             "footer": { "text": format!("Axolotl v{}", env!("CARGO_PKG_VERSION")) }
         }]
     })
+}
+
+fn report_color(snapshot: &MetricsSnapshot) -> u32 {
+    match snapshot
+        .server_errors
+        .saturating_add(snapshot.mineskin_errors)
+    {
+        0 => 0x002e_cc71,
+        1..=5 => 0x00f3_9c12,
+        _ => 0x00e7_4c3c,
+    }
+}
+
+fn server_stats(snapshot: &MetricsSnapshot) -> String {
+    let rss = process_rss_bytes().map_or_else(|| "Unavailable".to_owned(), format_bytes);
+    let load_average = load_average().unwrap_or_else(|| "Unavailable".to_owned());
+    format!(
+        "**Uptime:** {}\n**RSS:** {rss}\n**Load Avg:** {load_average}",
+        format_duration(snapshot.uptime)
+    )
+}
+
+fn traffic_stats(snapshot: &MetricsSnapshot) -> String {
+    let errors = snapshot
+        .client_errors
+        .saturating_add(snapshot.server_errors);
+    let error_percentage = percentage(errors, snapshot.requests);
+    format!(
+        "**Requests:** {}\n**Successful:** {}\n**Redirects:** {}\n**4xx:** {}\n**5xx:** {}\n**Error rate:** {error_percentage:.1}%\n**Latency:** {} avg / {} p50 / {} p95",
+        format_number(snapshot.requests),
+        format_number(snapshot.successful_responses),
+        format_number(snapshot.redirects),
+        format_number(snapshot.client_errors),
+        format_number(snapshot.server_errors),
+        format_latency(snapshot.request_latency.average()),
+        format_latency(snapshot.request_latency.percentile(50)),
+        format_latency(snapshot.request_latency.percentile(95))
+    )
+}
+
+fn format_endpoint_stats(snapshot: &EndpointSnapshot) -> String {
+    let errors = snapshot
+        .client_errors
+        .saturating_add(snapshot.server_errors);
+    let error_percentage = percentage(errors, snapshot.requests);
+    format!(
+        "**Requests:** {}\n**Successful:** {}\n**4xx:** {}\n**5xx:** {}\n**Error rate:** {error_percentage:.1}%\n**Latency:** {} avg / {} p50 / {} p95",
+        format_number(snapshot.requests),
+        format_number(snapshot.successful_responses),
+        format_number(snapshot.client_errors),
+        format_number(snapshot.server_errors),
+        format_latency(snapshot.latency.average()),
+        format_latency(snapshot.latency.percentile(50)),
+        format_latency(snapshot.latency.percentile(95))
+    )
+}
+
+fn other_endpoint_stats(snapshot: &MetricsSnapshot) -> String {
+    format!(
+        "**Jobs:** {}\n**Cape:** {}\n**Health:** {}\n**Docs / Other:** {}",
+        format_number(snapshot.job_requests),
+        format_number(snapshot.cape_requests),
+        format_number(snapshot.health_requests),
+        format_number(snapshot.other_requests)
+    )
+}
+
+fn client_stats(snapshot: &MetricsSnapshot, insight: &ClientInsight) -> String {
+    format!(
+        "**Pattern:** {}\n**Unique IPs:** {}\n**Attributed:** {} / {}\n**One-request IPs:** {} ({:.1}%)\n**Top IP:** {} req ({:.1}%)\n**Top 5 IPs:** {} req ({:.1}%)\n**Avg/IP:** {:.1}",
+        insight.pattern,
+        format_number(insight.unique_clients),
+        format_number(insight.attributed_requests),
+        format_number(snapshot.requests),
+        format_number(insight.one_request_clients),
+        insight.one_request_client_percentage,
+        format_number(insight.top_client_requests),
+        insight.top_client_percentage,
+        format_number(insight.top_five_requests),
+        insight.top_five_percentage,
+        insight.average_requests_per_client
+    )
+}
+
+fn mineskin_stats(snapshot: &MetricsSnapshot) -> String {
+    let error_percentage = percentage(snapshot.mineskin_errors, snapshot.mineskin_requests);
+    format!(
+        "**Requests:** {}\n**Errors:** {} ({error_percentage:.1}%)\n**Rate limits:** {}\n**Received:** {}\n**Latency:** {} avg / {} p50 / {} p95",
+        format_number(snapshot.mineskin_requests),
+        format_number(snapshot.mineskin_errors),
+        format_number(snapshot.mineskin_rate_limits),
+        format_bytes(snapshot.bytes_received_from_mineskin),
+        format_latency(snapshot.mineskin_latency.average()),
+        format_latency(snapshot.mineskin_latency.percentile(50)),
+        format_latency(snapshot.mineskin_latency.percentile(95))
+    )
 }
 
 #[derive(Debug, PartialEq)]
