@@ -80,6 +80,27 @@ New encrypted URLs use an authenticated `v2` payload. The decryption endpoint co
 
 Configure `MINESKIN_API_KEY` and `AES_SECRET_KEY` in the deployment environment, then deploy the repository. On Railway, Axolotl listens on the injected `PORT` and exposes `/health` for deployment health checks.
 
+## Run the published image
+
+Pushes to `main` build a release image with Railpack and publish it to
+`ghcr.io/skinsrestorer/axolotl`. Each build publishes three tags:
+
+- `latest`: the latest published build from `main`
+- `main`: the latest published build from `main`
+- `sha-<12-character-commit-sha>`: the build for a specific commit
+
+The workflow uses the `blacksmith-4vcpu-ubuntu-2404` runner and authenticates
+with `GITHUB_TOKEN`, with `packages: write` permission.
+
+Put the required environment variables in a local `.env` file. Then run:
+
+```bash
+docker run -d --name axolotl --restart unless-stopped \
+  --env-file .env -p 3000:3000 ghcr.io/skinsrestorer/axolotl:latest
+```
+
+The service is available at `http://localhost:3000`.
+
 ## Validate changes
 
 Run the same checks used by CI:
