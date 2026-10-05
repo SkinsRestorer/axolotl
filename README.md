@@ -113,3 +113,8 @@ cargo build --release --locked
 ```
 
 The tests include a fixed compatibility vector from the previous service. This protects existing encrypted URLs while the implementation remains in Rust.
+
+## Contributing and support
+
+Read [the contribution guide](CONTRIBUTING.md) for development and review.
+Use [the support guide](SUPPORT.md) for questions and issue routing.
