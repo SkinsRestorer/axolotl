@@ -110,7 +110,7 @@ impl MineSkinClient {
 
                 match response.job.status {
                     JobStatus::Completed => {
-                        if !response.has_skin() {
+                        if response.skin_uuid().is_none() {
                             return Err(MineSkinClientError::upstream(
                                 StatusCode::BAD_GATEWAY,
                                 "MineSkin job completed but no skin data provided",
@@ -640,6 +640,46 @@ mod tests {
     const CAPE_UUID: &str = "123e4567-e89b-12d3-a456-426614174001";
 
     type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+    #[tokio::test]
+    async fn rejects_completed_jobs_without_a_valid_skin_reference() -> TestResult {
+        for result in [None, Some(Value::Null), Some(json!("invalid-uuid"))] {
+            let server = MockServer::start().await;
+            let mut job = json!({ "id": "job-result", "status": "completed" });
+            if let Some(result) = result {
+                job.as_object_mut()
+                    .ok_or("job is not an object")?
+                    .insert("result".to_owned(), result);
+            }
+            Mock::given(method("GET"))
+                .and(path("/v2/queue/job-result"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "job": job,
+                    "skin": false
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+            let client = MineSkinClient::new(
+                &config,
+                UrlCipher::new(config.aes_secret_key.as_deref()),
+                Arc::new(Metrics::default()),
+            )?;
+
+            let result = client.poll_job("job-result", Duration::ZERO).await;
+            assert!(matches!(
+                result,
+                Err(MineSkinClientError::Upstream {
+                    status: StatusCode::BAD_GATEWAY,
+                    ..
+                } | MineSkinClientError::Crypto(crate::crypto::CryptoError::InvalidUuid))
+            ));
+            server.verify().await;
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn serves_stale_capes_when_refresh_fails() -> TestResult {

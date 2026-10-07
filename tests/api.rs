@@ -298,6 +298,28 @@ async fn preserves_upload_rate_limits_and_cors_headers() -> TestResult {
 
 #[tokio::test]
 async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
+    let completed = completed_job_response();
+    for skin in [
+        completed.get("skin").cloned(),
+        Some(Value::Null),
+        Some(json!(false)),
+        None,
+    ] {
+        let mut response = completed.clone();
+        let object = response
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("job response is not an object"))?;
+        if let Some(skin) = skin {
+            object.insert("skin".to_owned(), skin);
+        } else {
+            object.remove("skin");
+        }
+        verify_encrypted_upload(response).await?;
+    }
+    Ok(())
+}
+
+async fn verify_encrypted_upload(completed: Value) -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v2/capes"))
@@ -335,7 +357,7 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
         .await;
     Mock::given(method("GET"))
         .and(path("/v2/queue/job-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completed_job_response()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completed))
         .expect(1)
         .mount(&server)
         .await;
@@ -356,30 +378,22 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
 
     assert_eq!(response.status(), StatusCode::OK);
     let response = json_body(response).await?;
-    assert_eq!(
-        response
-            .get("success")
-            .ok_or_else(|| io::Error::other("response did not contain success"))?,
-        &json!(true)
-    );
-    assert_eq!(
-        response
-            .get("warnings")
-            .ok_or_else(|| io::Error::other("response did not contain warnings"))?,
-        &json!([])
-    );
-    assert_eq!(
-        response
-            .get("messages")
-            .ok_or_else(|| io::Error::other("response did not contain messages"))?,
-        &json!([])
-    );
     let encrypted_url = response
         .get("skin")
         .and_then(|skin| skin.get("url"))
         .and_then(Value::as_str)
         .ok_or_else(|| io::Error::other("response did not contain an encrypted skin URL"))?;
     assert!(encrypted_url.starts_with("skinsrestorer-axolotl://v2/"));
+    assert!(!response.to_string().contains(SKIN_UUID));
+    assert_eq!(
+        response,
+        json!({
+            "success": true,
+            "skin": { "url": encrypted_url },
+            "warnings": [],
+            "messages": []
+        })
+    );
 
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("encryptedUrl", encrypted_url)
@@ -396,6 +410,55 @@ async fn forwards_uploads_and_returns_an_encrypted_skin_url() -> TestResult {
     );
 
     server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn keeps_job_results_encrypted_and_ignores_pending_results() -> TestResult {
+    for status in ["completed", "waiting"] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/queue/job-result"))
+            .and(header_matcher("authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "job": { "id": "job-result", "status": status, "result": SKIN_UUID },
+                "skin": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = test_app(&format!("{}/v2/", server.uri()))?;
+        let response = send(
+            &app,
+            Request::get("/mineskin/jobs/job-result").body(Body::empty())?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = json_body(response).await?;
+        assert!(!response.to_string().contains(SKIN_UUID));
+        let expected_skin = if status == "completed" {
+            let url = response
+                .get("skin")
+                .and_then(|skin| skin.get("url"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| io::Error::other("response has no encrypted skin URL"))?;
+            assert!(url.starts_with("skinsrestorer-axolotl://v2/"));
+            json!({ "url": url })
+        } else {
+            Value::Null
+        };
+        assert_eq!(
+            response,
+            json!({
+                "success": true,
+                "skin": expected_skin,
+                "warnings": [],
+                "messages": []
+            })
+        );
+        server.verify().await;
+    }
     Ok(())
 }
 

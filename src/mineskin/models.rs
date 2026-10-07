@@ -20,6 +20,7 @@ pub struct MineSkinErrorItem {
 pub struct JobDetails {
     pub id: String,
     pub status: JobStatus,
+    pub result: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -57,23 +58,17 @@ impl JobSuccessResponse {
         Ok(())
     }
 
-    #[must_use]
-    pub fn has_skin(&self) -> bool {
-        matches!(self.skin, Some(SkinResult::Skin(_)))
-    }
-
     pub fn into_sanitized(
         self,
         encrypted_url: Option<String>,
     ) -> Result<SanitizedResponse, &'static str> {
-        let skin = match self.skin {
-            Some(SkinResult::Skin(_)) => Some(SanitizedSkin {
+        self.validate()?;
+        let skin = if self.skin_uuid().is_some() {
+            Some(SanitizedSkin {
                 url: encrypted_url.ok_or("encrypted skin URL is missing")?,
-            }),
-            Some(SkinResult::Boolean(false)) | None => None,
-            Some(SkinResult::Boolean(true)) => {
-                return Err("skin must be an object, false, or null");
-            }
+            })
+        } else {
+            None
         };
 
         Ok(SanitizedResponse {
@@ -88,7 +83,13 @@ impl JobSuccessResponse {
     pub fn skin_uuid(&self) -> Option<&str> {
         match self.skin.as_ref() {
             Some(SkinResult::Skin(skin)) => Some(&skin.uuid),
-            Some(SkinResult::Boolean(_)) | None => None,
+            Some(SkinResult::Boolean(_)) | None => {
+                if self.job.status == JobStatus::Completed {
+                    self.job.result.as_deref()
+                } else {
+                    None
+                }
+            }
         }
     }
 }

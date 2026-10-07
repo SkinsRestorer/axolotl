@@ -11,3 +11,6 @@
 .*.sw[a-p]
 .DS_Store
 *.log
+
+# Browser automation artifacts
+/.playwright-mcp/
