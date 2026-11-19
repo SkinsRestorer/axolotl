@@ -256,6 +256,10 @@ mod tests {
         "AAECAwQFBgcICQoLDA0OD8imM586fmS6OpsiL50KsnvRWjSo4S7vTKK3sl3b3l7RG1vToG52Tih6IdrpltHyHA==";
 
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report failures while Result propagates setup and operation errors"
+    )]
     fn matches_legacy_crypto_vector() -> Result<(), CryptoError> {
         let cipher = UrlCipher::new(Some("test-secret"));
         let iv = [
@@ -270,6 +274,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report failures while Result propagates setup and operation errors"
+    )]
     fn decrypts_legacy_crypto_vector() -> Result<(), CryptoError> {
         let cipher = UrlCipher::new(Some("test-secret"));
 
@@ -280,6 +288,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "Test assertions report failures while Result propagates setup and operation errors"
+    )]
     fn encrypts_authenticated_urls_and_rejects_tampering() -> Result<(), Box<dyn std::error::Error>>
     {
         let cipher = UrlCipher::new(Some("test-secret"));

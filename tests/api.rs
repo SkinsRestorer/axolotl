@@ -22,6 +22,10 @@ const CAPE_UUID: &str = "123e4567-e89b-12d3-a456-426614174001";
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn serves_health_and_json_not_found_responses() -> TestResult {
     let app = test_app("http://127.0.0.1:9/v2/")?;
 
@@ -36,6 +40,10 @@ async fn serves_health_and_json_not_found_responses() -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn decrypts_urls_created_by_the_legacy_service() -> TestResult {
     let app = test_app("http://127.0.0.1:9/v2/")?;
     let query = form_urlencoded::Serializer::new(String::new())
@@ -56,6 +64,10 @@ async fn decrypts_urls_created_by_the_legacy_service() -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn caches_supported_capes_and_normalizes_texture_urls() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -103,6 +115,10 @@ async fn caches_supported_capes_and_normalizes_texture_urls() -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn maps_mineskin_job_not_found_to_the_public_contract() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -130,6 +146,10 @@ async fn maps_mineskin_job_not_found_to_the_public_contract() -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn accepts_new_upstream_job_statuses_without_parsing_unused_fields() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -168,6 +188,10 @@ async fn accepts_new_upstream_job_statuses_without_parsing_unused_fields() -> Te
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn deduplicates_concurrent_failed_cape_refreshes() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -196,6 +220,10 @@ async fn deduplicates_concurrent_failed_cape_refreshes() -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn rejects_oversized_upstream_responses() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -217,6 +245,10 @@ async fn rejects_oversized_upstream_responses() -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn rejects_non_https_cape_urls() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -243,6 +275,10 @@ async fn rejects_non_https_cape_urls() -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn rejects_invalid_upload_cape_uuid_with_the_public_error() -> TestResult {
     let server = MockServer::start().await;
     let app = test_app(&format!("{}/v2/", server.uri()))?;
@@ -267,6 +303,10 @@ async fn rejects_invalid_upload_cape_uuid_with_the_public_error() -> TestResult 
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn preserves_upload_rate_limits_and_cors_headers() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -446,6 +486,10 @@ async fn verify_encrypted_upload(completed: Value) -> TestResult {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn keeps_job_results_encrypted_and_ignores_pending_results() -> TestResult {
     for status in ["completed", "waiting"] {
         let server = MockServer::start().await;
@@ -495,6 +539,10 @@ async fn keeps_job_results_encrypted_and_ignores_pending_results() -> TestResult
 }
 
 #[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 async fn rejects_uploads_above_the_concurrency_limit_before_processing() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -542,16 +590,16 @@ async fn rejects_uploads_above_the_concurrency_limit_before_processing() -> Test
 
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     first.abort();
-    #[expect(
-        clippy::let_underscore_must_use,
-        reason = "the test only waits for the aborted request to finish before verifying upstream calls"
-    )]
-    let _ = first.await;
+    drop(first.await);
     server.verify().await;
     Ok(())
 }
 
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "Test assertions report failures while Result propagates setup and operation errors"
+)]
 fn openapi_document_exposes_the_complete_public_surface() -> TestResult {
     let value = serde_json::to_value(api_document(4242))?;
     let paths = value

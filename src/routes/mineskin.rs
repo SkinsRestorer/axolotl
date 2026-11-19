@@ -103,8 +103,8 @@ pub async fn upload_skin(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
     let Query(query) = query.map_err(|error| ApiError::bad_request(error.body_text()))?;
-    let poll_interval = validate_poll_interval(query.wait_ms.map_or(
-        state.mineskin.default_poll_interval(),
+    let poll_interval = validate_poll_interval(query.wait_ms.map_or_else(
+        || state.mineskin.default_poll_interval(),
         Duration::from_millis,
     ))?;
     let upload = timeout(
