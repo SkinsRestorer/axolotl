@@ -78,6 +78,10 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "snapshots must observe request totals and client attribution under the same lock"
+    )]
     pub fn record_request(
         &self,
         path: &str,
@@ -232,6 +236,10 @@ fn acknowledge_clients(
     requests: &mut HashMap<IpAddr, u64>,
     acknowledged_requests: &HashMap<IpAddr, u64>,
 ) {
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "acknowledgement subtracts each client's count independently"
+    )]
     for (client_ip, acknowledged) in acknowledged_requests {
         if let Some(current) = requests.get_mut(client_ip) {
             *current = current.saturating_sub(*acknowledged);

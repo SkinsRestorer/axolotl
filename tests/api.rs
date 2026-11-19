@@ -400,15 +400,21 @@ async fn verify_encrypted_upload(completed: Value) -> TestResult {
     )
     .await?;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK, "upload with cape failed");
     let response = json_body(response).await?;
     let encrypted_url = response
         .get("skin")
         .and_then(|skin| skin.get("url"))
         .and_then(Value::as_str)
         .ok_or_else(|| io::Error::other("response did not contain an encrypted skin URL"))?;
-    assert!(encrypted_url.starts_with("skinsrestorer-axolotl://v2/"));
-    assert!(!response.to_string().contains(SKIN_UUID));
+    assert!(
+        encrypted_url.starts_with("skinsrestorer-axolotl://v2/"),
+        "unexpected encrypted skin URL: {encrypted_url}"
+    );
+    assert!(
+        !response.to_string().contains(SKIN_UUID),
+        "upload response exposed skin UUID {SKIN_UUID}: {response}"
+    );
     assert_eq!(
         response,
         json!({
@@ -416,7 +422,8 @@ async fn verify_encrypted_upload(completed: Value) -> TestResult {
             "skin": { "url": encrypted_url },
             "warnings": [],
             "messages": []
-        })
+        }),
+        "unexpected upload response for cape {CAPE_UUID}"
     );
 
     let query = form_urlencoded::Serializer::new(String::new())
@@ -427,10 +434,11 @@ async fn verify_encrypted_upload(completed: Value) -> TestResult {
         Request::get(format!("/mineskin/decrypt-url?{query}")).body(Body::empty())?,
     )
     .await?;
-    assert_eq!(decrypted.status(), StatusCode::OK);
+    assert_eq!(decrypted.status(), StatusCode::OK, "decryption failed");
     assert_eq!(
         json_body(decrypted).await?,
-        json!({ "url": format!("https://minesk.in/{SKIN_UUID}") })
+        json!({ "url": format!("https://minesk.in/{SKIN_UUID}") }),
+        "decrypted URL did not match the uploaded skin"
     );
 
     server.verify().await;
@@ -534,6 +542,10 @@ async fn rejects_uploads_above_the_concurrency_limit_before_processing() -> Test
 
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     first.abort();
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the test only waits for the aborted request to finish before verifying upstream calls"
+    )]
     let _ = first.await;
     server.verify().await;
     Ok(())

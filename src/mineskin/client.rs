@@ -231,6 +231,7 @@ impl MineSkinClient {
                 }));
                 state.last_failure = None;
                 drop(refresh);
+                drop(state);
 
                 Ok(capes)
             }
