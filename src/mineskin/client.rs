@@ -641,6 +641,10 @@ impl MineSkinClientError {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "tests assert inside Result-returning test functions"
+)]
 mod tests {
     use std::{error::Error, time::Duration};
 
@@ -657,10 +661,6 @@ mod tests {
     type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
     #[tokio::test]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "Test assertions report failures while Result propagates setup and operation errors"
-    )]
     async fn rejects_completed_jobs_without_a_valid_skin_reference() -> TestResult {
         for result in [None, Some(Value::Null), Some(json!("invalid-uuid"))] {
             let server = MockServer::start().await;
@@ -701,10 +701,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "Test assertions report failures while Result propagates setup and operation errors"
-    )]
     async fn serves_stale_capes_when_refresh_fails() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -751,10 +747,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "Test assertions report failures while Result propagates setup and operation errors"
-    )]
     fn encodes_job_ids_as_single_path_segments() -> TestResult {
         let config = AppConfig::for_tests(Url::parse("https://example.com/v2/")?);
         let client = MineSkinClient::new(
