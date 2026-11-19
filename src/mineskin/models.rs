@@ -1,3 +1,5 @@
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::{fmt, sync::Arc};
 
 use serde::{

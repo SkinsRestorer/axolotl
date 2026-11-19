@@ -1,3 +1,17 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
+
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "Environment mutation is unsound with threads. Pass configuration explicitly." },
+    { path = "std::env::remove_var", reason = "Environment mutation is unsound with threads. Pass configuration explicitly." },
+    { path = "std::thread::sleep", reason = "Use tokio::time::sleep to avoid blocking a runtime worker." },
+    { path = "std::process::Command::output", reason = "Use tokio::process::Command::output to collect output asynchronously." },
+    { path = "std::process::Command::status", reason = "Use tokio::process::Command::status to wait asynchronously." },
+    { path = "std::process::Command::spawn", reason = "Use tokio::process::Command::spawn to manage child processes asynchronously." },
+    { path = "std::fs::read", reason = "Use tokio::fs::read or do the read in tokio::task::spawn_blocking." },
+    { path = "std::fs::read_to_string", reason = "Use tokio::fs::read_to_string or do the read in tokio::task::spawn_blocking." },
+    { path = "std::fs::write", reason = "Use tokio::fs::write or do the write in tokio::task::spawn_blocking." },
+    { path = "reqwest::Client::new", reason = "Use crate::http_client::builder to set connect and request timeouts." },
+    { path = "reqwest::get", reason = "Use a client from crate::http_client::builder to set connect and request timeouts." },
+]

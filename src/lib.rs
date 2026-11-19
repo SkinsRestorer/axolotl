@@ -15,6 +15,7 @@ mod app;
 mod config;
 mod crypto;
 mod error;
+mod http_client;
 mod metrics;
 mod mineskin;
 pub mod reporter;

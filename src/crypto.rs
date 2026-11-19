@@ -1,3 +1,5 @@
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 #[cfg(test)]
 use aes::cipher::BlockModeEncrypt;
 use aes::{
@@ -109,7 +111,11 @@ impl UrlCipher {
                 tracing::debug!(%error, "Failed to encrypt MineSkin URL");
                 CryptoError::Encryption
             })?;
-        let mut combined = Vec::with_capacity(nonce.len() + ciphertext.len());
+        let combined_length = nonce
+            .len()
+            .checked_add(ciphertext.len())
+            .ok_or(CryptoError::Encryption)?;
+        let mut combined = Vec::with_capacity(combined_length);
         combined.extend_from_slice(&nonce);
         combined.extend_from_slice(&ciphertext);
 
@@ -131,7 +137,9 @@ impl UrlCipher {
             return Err(CryptoError::InvalidPayload);
         }
 
-        let (nonce, ciphertext) = combined.split_at(GCM_NONCE_LENGTH);
+        let (nonce, ciphertext) = combined
+            .split_at_checked(GCM_NONCE_LENGTH)
+            .ok_or(CryptoError::InvalidPayload)?;
         let nonce: &[u8; GCM_NONCE_LENGTH] =
             nonce.try_into().map_err(|_| CryptoError::InvalidPayload)?;
         let key = self.key()?;
@@ -323,6 +331,23 @@ mod tests {
             Err(CryptoError::InvalidPayload)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn rejects_truncated_encrypted_payloads() {
+        let cipher = UrlCipher::new(Some("test-secret"));
+        let authenticated = URL_SAFE_NO_PAD.encode([0; GCM_NONCE_LENGTH + GCM_TAG_LENGTH]);
+        let legacy = STANDARD.encode([0; 16]);
+
+        for payload in [
+            format!("{AUTHENTICATED_PAYLOAD_PREFIX}{authenticated}"),
+            legacy,
+        ] {
+            assert!(matches!(
+                cipher.decrypt_url(&format!("{ENCRYPTED_URL_SCHEME}{payload}")),
+                Err(CryptoError::InvalidPayload)
+            ));
+        }
     }
 
     #[test]

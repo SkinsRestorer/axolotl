@@ -1,6 +1,7 @@
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::{
     collections::HashMap,
-    fs,
     net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -9,13 +10,17 @@ use std::{
 use reqwest::Url;
 use serde_json::json;
 use tokio::{
+    fs,
     sync::oneshot,
     task::JoinHandle,
     time::{MissedTickBehavior, interval},
 };
 use tracing::{error, info};
 
-use crate::metrics::{EndpointSnapshot, Metrics, MetricsSnapshot};
+use crate::{
+    http_client,
+    metrics::{EndpointSnapshot, Metrics, MetricsSnapshot},
+};
 
 const REPORT_INTERVAL: Duration = Duration::from_mins(5);
 
@@ -39,8 +44,7 @@ impl DiscordReporter {
         let initial_snapshot = metrics.snapshot();
         let reporter_started_at = Instant::now();
         let task = tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
+            let client = match http_client::builder(Duration::from_secs(15))
                 .https_only(true)
                 .build()
             {
@@ -109,16 +113,17 @@ async fn send_report(
     webhook: &Url,
     snapshot: &MetricsSnapshot,
 ) -> Result<(), reqwest::Error> {
+    let server = server_stats(snapshot).await;
     client
         .post(webhook.clone())
-        .json(&build_report(snapshot))
+        .json(&build_report(snapshot, &server))
         .send()
         .await?
         .error_for_status()?;
     Ok(())
 }
 
-fn build_report(snapshot: &MetricsSnapshot) -> serde_json::Value {
+fn build_report(snapshot: &MetricsSnapshot, server: &str) -> serde_json::Value {
     let client_insight = ClientInsight::from_snapshot(snapshot);
     let report_period = format_report_period(snapshot.report_period);
 
@@ -129,7 +134,7 @@ fn build_report(snapshot: &MetricsSnapshot) -> serde_json::Value {
             "fields": [
                 {
                     "name": "Server",
-                    "value": server_stats(snapshot),
+                    "value": server,
                     "inline": false
                 },
                 {
@@ -180,9 +185,13 @@ fn report_color(snapshot: &MetricsSnapshot) -> u32 {
     }
 }
 
-fn server_stats(snapshot: &MetricsSnapshot) -> String {
-    let rss = process_rss_bytes().map_or_else(|| "Unavailable".to_owned(), format_bytes);
-    let load_average = load_average().unwrap_or_else(|| "Unavailable".to_owned());
+async fn server_stats(snapshot: &MetricsSnapshot) -> String {
+    let rss = process_rss_bytes()
+        .await
+        .map_or_else(|| "Unavailable".to_owned(), format_bytes);
+    let load_average = load_average()
+        .await
+        .unwrap_or_else(|| "Unavailable".to_owned());
     format!(
         "**Uptime:** {}\n**RSS:** {rss}\n**Load Avg:** {load_average}",
         format_duration(snapshot.uptime)
@@ -423,8 +432,8 @@ fn format_latency(duration: Duration) -> String {
     format!("{:.2} s", duration.as_secs_f64())
 }
 
-fn process_rss_bytes() -> Option<u64> {
-    let status = fs::read_to_string("/proc/self/status").ok()?;
+async fn process_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").await.ok()?;
     let kibibytes = status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))?
@@ -435,8 +444,8 @@ fn process_rss_bytes() -> Option<u64> {
     kibibytes.checked_mul(1024)
 }
 
-fn load_average() -> Option<String> {
-    let load_average = fs::read_to_string("/proc/loadavg").ok()?;
+async fn load_average() -> Option<String> {
+    let load_average = fs::read_to_string("/proc/loadavg").await.ok()?;
     let values = load_average.split_whitespace().take(3).collect::<Vec<_>>();
     (values.len() == 3).then(|| values.join(" / "))
 }

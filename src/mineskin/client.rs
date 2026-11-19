@@ -1,3 +1,5 @@
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -24,6 +26,7 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     crypto::{MINESKIN_URL_PREFIX, UrlCipher},
+    http_client,
     metrics::Metrics,
 };
 
@@ -54,9 +57,8 @@ impl MineSkinClient {
         cipher: UrlCipher,
         metrics: Arc<Metrics>,
     ) -> Result<Self, MineSkinClientError> {
-        let http = Client::builder()
+        let http = http_client::builder(config.request_timeout)
             .user_agent(MINESKIN_USER_AGENT)
-            .timeout(config.request_timeout)
             .build()
             .map_err(MineSkinClientError::Request)?;
 
@@ -386,7 +388,11 @@ impl MineSkinClient {
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(MineSkinClientError::Request)?;
-                if body.len().saturating_add(chunk.len()) > MAXIMUM_UPSTREAM_RESPONSE_SIZE {
+                if body
+                    .len()
+                    .checked_add(chunk.len())
+                    .is_none_or(|length| length > MAXIMUM_UPSTREAM_RESPONSE_SIZE)
+                {
                     return Err(MineSkinClientError::unexpected(
                         context,
                         "response exceeded 1 MiB",
