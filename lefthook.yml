@@ -9,9 +9,22 @@ pre-commit:
       run: cargo fmt --all -- --check
       files: git diff --cached --name-only --diff-filter=ACMR
 
+commit-msg:
+  commands:
+    conventional-commits:
+      run: |
+        subject=$(head -n 1 "{1}") || exit 1
+        case "$subject" in
+          "Merge "*|'Revert "'*|"fixup! "*|"squash! "*|"amend! "*) exit 0 ;;
+        esac
+        if ! printf '%s\n' "$subject" | grep -Eq '^(feat|fix|docs|refactor|test|chore|ci|build|perf|style|revert)(\([^()[:space:]]+\))?!?: [^[:space:]]'; then
+          printf '%s\n' 'Use a Conventional Commit subject, for example: fix(parser): handle empty input.' >&2
+          exit 1
+        fi
+
 pre-push:
   commands:
     clippy:
       run: cargo clippy --all-targets --all-features --locked -- -D warnings
       files: git diff --name-only @{upstream} HEAD
-      glob: "{*.rs,Cargo.toml,Cargo.lock,rust-toolchain.toml}"
+      glob: "{*.rs,Cargo.toml,Cargo.lock,rust-toolchain.toml,clippy.toml}"
