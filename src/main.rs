@@ -20,8 +20,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    dotenvy::dotenv().ok();
+    let dotenv = dotenvy::dotenv();
     init_tracing()?;
+    if let Err(error) = dotenv
+        && !error.not_found()
+    {
+        tracing::warn!(%error, "Failed to load .env");
+    }
 
     let config = AppConfig::from_env()?;
     let port = config.port();

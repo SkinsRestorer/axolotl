@@ -288,12 +288,14 @@ struct ClientInsight {
 }
 
 impl ClientInsight {
-    #[allow(clippy::cast_precision_loss)]
     fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
         Self::from_requests(&snapshot.client_requests)
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the reported metric is rounded for display"
+    )]
     fn from_requests(requests: &HashMap<IpAddr, u64>) -> Self {
         let mut request_counts = requests.values().copied().collect::<Vec<_>>();
         request_counts.sort_unstable_by(|left, right| right.cmp(left));
@@ -343,7 +345,10 @@ impl ClientInsight {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the reported metric is rounded for display"
+)]
 fn percentage(part: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
@@ -352,7 +357,10 @@ fn percentage(part: u64, total: u64) -> f64 {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the reported metric is rounded for display"
+)]
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;

@@ -46,7 +46,7 @@ pub struct DecryptUrlQuery {
 
 #[derive(Debug, ToSchema)]
 #[schema(rename_all = "camelCase")]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "used only to describe the OpenAPI schema")]
 pub struct UploadRequest {
     #[schema(value_type = String, format = Binary)]
     file: String,
@@ -59,7 +59,7 @@ pub struct UploadRequest {
 
 #[derive(Debug, ToSchema)]
 #[serde(rename_all = "lowercase")]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "used only to describe the OpenAPI schema")]
 enum UploadVariant {
     Classic,
     Slim,
@@ -109,12 +109,14 @@ pub async fn upload_skin(
     ))?;
     let upload = timeout(
         state.upload_body_timeout,
-        parse_upload(
-            multipart.map_err(|_| ApiError::bad_request("Failed to parse multipart form data"))?,
-        ),
+        parse_upload(multipart.map_err(|error| {
+            ApiError::bad_request("Failed to parse multipart form data").with_source(error)
+        })?),
     )
     .await
-    .map_err(|_| ApiError::new(StatusCode::REQUEST_TIMEOUT, "Skin upload body timed out"))??;
+    .map_err(|error| {
+        ApiError::new(StatusCode::REQUEST_TIMEOUT, "Skin upload body timed out").with_source(error)
+    })??;
 
     let supported_capes = state
         .mineskin
@@ -270,11 +272,9 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
     let mut cape_uuid = None;
     let mut cape_alias = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| ApiError::bad_request("Failed to parse multipart form data"))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        ApiError::bad_request("Failed to parse multipart form data").with_source(error)
+    })? {
         let Some(field_name) = field.name().map(str::to_owned) else {
             continue;
         };
@@ -283,10 +283,9 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
             "file" if file.is_none() && field.file_name().is_some() => {
                 let file_name = field.file_name().map(str::to_owned);
                 let content_type = field.content_type().map(str::to_owned);
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|_| ApiError::bad_request("Failed to parse multipart form data"))?;
+                let bytes = field.bytes().await.map_err(|error| {
+                    ApiError::bad_request("Failed to parse multipart form data").with_source(error)
+                })?;
                 if bytes.len() > MAXIMUM_FILE_SIZE {
                     return Err(ApiError::bad_request("Skin file must not exceed 5 MiB"));
                 }
@@ -330,7 +329,7 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
         .or(cape_alias)
         .ok_or_else(|| ApiError::bad_request("capeUuid is required"))?;
     let cape_uuid = Uuid::parse_str(&cape_uuid)
-        .map_err(|_| ApiError::bad_request("capeUuid must be a valid UUID"))?
+        .map_err(|error| ApiError::bad_request("capeUuid must be a valid UUID").with_source(error))?
         .hyphenated()
         .to_string();
 
@@ -345,10 +344,9 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
 }
 
 async fn read_text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, ApiError> {
-    field
-        .text()
-        .await
-        .map_err(|_| ApiError::bad_request("Failed to parse multipart form data"))
+    field.text().await.map_err(|error| {
+        ApiError::bad_request("Failed to parse multipart form data").with_source(error)
+    })
 }
 
 fn validate_poll_interval(interval: Duration) -> Result<Duration, ApiError> {

@@ -47,9 +47,15 @@ impl UrlCipher {
     }
 
     pub fn encrypt_uuid(&self, uuid: &str) -> Result<String, CryptoError> {
-        let uuid = canonical_uuid(uuid)?;
+        let uuid = canonical_uuid(uuid).map_err(|error| {
+            tracing::debug!(%error, "Invalid MineSkin UUID");
+            CryptoError::InvalidUuid
+        })?;
         let mut nonce = [0_u8; GCM_NONCE_LENGTH];
-        getrandom::fill(&mut nonce).map_err(|_| CryptoError::Randomness)?;
+        getrandom::fill(&mut nonce).map_err(|error| {
+            tracing::debug!(%error, "Failed to obtain secure random bytes");
+            CryptoError::Randomness
+        })?;
         self.encrypt_uuid_with_nonce(&uuid, nonce)
     }
 
@@ -61,6 +67,10 @@ impl UrlCipher {
         self.encrypt_uuid(uuid)
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "invalid encrypted payloads share one error without exposing validation details"
+    )]
     pub fn decrypt_url(&self, encrypted_url: &str) -> Result<String, CryptoError> {
         let payload = encrypted_url
             .strip_prefix(ENCRYPTED_URL_SCHEME)
@@ -95,7 +105,10 @@ impl UrlCipher {
                     aad: AUTHENTICATED_PAYLOAD_AAD,
                 },
             )
-            .map_err(|_| CryptoError::Encryption)?;
+            .map_err(|error| {
+                tracing::debug!(%error, "Failed to encrypt MineSkin URL");
+                CryptoError::Encryption
+            })?;
         let mut combined = Vec::with_capacity(nonce.len() + ciphertext.len());
         combined.extend_from_slice(&nonce);
         combined.extend_from_slice(&ciphertext);
@@ -106,6 +119,10 @@ impl UrlCipher {
         ))
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "invalid encrypted payloads share one error without exposing validation details"
+    )]
     fn decrypt_authenticated_uuid(&self, payload: &str) -> Result<String, CryptoError> {
         let combined = URL_SAFE_NO_PAD
             .decode(payload)
@@ -132,6 +149,10 @@ impl UrlCipher {
         String::from_utf8(plaintext).map_err(|_| CryptoError::InvalidPayload)
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "invalid encrypted payloads share one error without exposing validation details"
+    )]
     fn decrypt_legacy_uuid(&self, payload: &str) -> Result<String, CryptoError> {
         let mut combined = STANDARD
             .decode(payload)
@@ -166,15 +187,19 @@ impl UrlCipher {
             .checked_add(16)
             .ok_or(CryptoError::Encryption)?;
         let mut buffer = Vec::new();
-        buffer
-            .try_reserve_exact(buffer_length)
-            .map_err(|_| CryptoError::Encryption)?;
+        buffer.try_reserve_exact(buffer_length).map_err(|error| {
+            tracing::debug!(%error, "Failed to encrypt MineSkin URL");
+            CryptoError::Encryption
+        })?;
         buffer.extend_from_slice(plaintext);
         buffer.resize(buffer_length, 0);
 
         let ciphertext = Aes256CbcEncryptor::new(key.into(), (&iv).into())
             .encrypt_padded::<Pkcs7>(&mut buffer, plaintext.len())
-            .map_err(|_| CryptoError::Encryption)?;
+            .map_err(|error| {
+                tracing::debug!(%error, "Failed to encrypt MineSkin URL");
+                CryptoError::Encryption
+            })?;
         let combined_length = iv
             .len()
             .checked_add(ciphertext.len())
@@ -182,7 +207,10 @@ impl UrlCipher {
         let mut combined = Vec::new();
         combined
             .try_reserve_exact(combined_length)
-            .map_err(|_| CryptoError::Encryption)?;
+            .map_err(|error| {
+                tracing::debug!(%error, "Failed to encrypt MineSkin URL");
+                CryptoError::Encryption
+            })?;
         combined.extend_from_slice(&iv);
         combined.extend_from_slice(ciphertext);
 
@@ -215,10 +243,8 @@ pub enum CryptoError {
     Randomness,
 }
 
-fn canonical_uuid(value: &str) -> Result<String, CryptoError> {
-    Uuid::parse_str(value)
-        .map(|uuid| uuid.hyphenated().to_string())
-        .map_err(|_| CryptoError::InvalidUuid)
+fn canonical_uuid(value: &str) -> Result<String, uuid::Error> {
+    Uuid::parse_str(value).map(|uuid| uuid.hyphenated().to_string())
 }
 
 #[cfg(test)]
@@ -254,7 +280,8 @@ mod tests {
     }
 
     #[test]
-    fn encrypts_authenticated_urls_and_rejects_tampering() -> Result<(), CryptoError> {
+    fn encrypts_authenticated_urls_and_rejects_tampering() -> Result<(), Box<dyn std::error::Error>>
+    {
         let cipher = UrlCipher::new(Some("test-secret"));
         let encrypted = cipher.encrypt_uuid_with_nonce(UUID, [0x2a; GCM_NONCE_LENGTH])?;
 
@@ -271,9 +298,7 @@ mod tests {
                 "{ENCRYPTED_URL_SCHEME}{AUTHENTICATED_PAYLOAD_PREFIX}"
             ))
             .ok_or(CryptoError::InvalidFormat)?;
-        let mut combined = URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|_| CryptoError::InvalidPayload)?;
+        let mut combined = URL_SAFE_NO_PAD.decode(payload)?;
         let last = combined.last_mut().ok_or(CryptoError::InvalidPayload)?;
         *last ^= 1;
         let tampered = format!(

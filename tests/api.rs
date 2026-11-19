@@ -243,6 +243,30 @@ async fn rejects_non_https_cape_urls() -> TestResult {
 }
 
 #[tokio::test]
+async fn rejects_invalid_upload_cape_uuid_with_the_public_error() -> TestResult {
+    let server = MockServer::start().await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+    let boundary = "axolotl-invalid-cape-boundary";
+    let response = send(
+        &app,
+        Request::post("/mineskin/skins?waitMs=250")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_upload_with_cape(boundary, "invalid")))?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "capeUuid must be a valid UUID" })
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn preserves_upload_rate_limits_and_cors_headers() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

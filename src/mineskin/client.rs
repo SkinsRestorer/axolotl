@@ -132,12 +132,15 @@ impl MineSkinClient {
             }
         };
 
-        timeout(self.max_poll_duration, poll).await.map_err(|_| {
-            MineSkinClientError::upstream(
-                StatusCode::GATEWAY_TIMEOUT,
-                "Timed out waiting for MineSkin job to finish",
-            )
-        })?
+        timeout(self.max_poll_duration, poll)
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "MineSkin polling deadline elapsed");
+                MineSkinClientError::upstream(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Timed out waiting for MineSkin job to finish",
+                )
+            })?
     }
 
     pub fn sanitize_job(
@@ -156,12 +159,15 @@ impl MineSkinClient {
     }
 
     pub async fn enqueue(&self, upload: UploadPayload) -> Result<JobDetails, MineSkinClientError> {
-        let file_length = u64::try_from(upload.file.len())
-            .map_err(|_| MineSkinClientError::InvalidUpload("Skin file is too large".to_owned()))?;
+        let file_length = u64::try_from(upload.file.len()).map_err(|error| {
+            tracing::debug!(%error, "Skin file length exceeds the multipart limit");
+            MineSkinClientError::InvalidUpload("Skin file is too large".to_owned())
+        })?;
         let mut file = Part::stream_with_length(upload.file, file_length)
             .file_name(upload.file_name.unwrap_or_else(|| "skin.png".to_owned()));
         if let Some(content_type) = upload.content_type {
-            file = file.mime_str(&content_type).map_err(|_| {
+            file = file.mime_str(&content_type).map_err(|error| {
+                tracing::debug!(%error, "Invalid skin file content type");
                 MineSkinClientError::InvalidUpload("Invalid skin file content type".to_owned())
             })?;
         }
@@ -286,7 +292,8 @@ impl MineSkinClient {
             .map(|cape| {
                 let uuid = Uuid::parse_str(&cape.uuid)
                     .map(|uuid| uuid.hyphenated().to_string())
-                    .map_err(|_| {
+                    .map_err(|error| {
+                        tracing::debug!(%error, "Invalid MineSkin cape UUID");
                         MineSkinClientError::unexpected(
                             "MineSkin cape response",
                             "cape UUID is invalid",
@@ -536,7 +543,8 @@ fn ensure_upstream_success(
 }
 
 fn normalize_texture_url(value: &str) -> Result<String, MineSkinClientError> {
-    let mut url = Url::parse(value).map_err(|_| {
+    let mut url = Url::parse(value).map_err(|error| {
+        tracing::debug!(%error, "Invalid MineSkin cape URL");
         MineSkinClientError::unexpected("MineSkin cape response", "cape URL is invalid")
     })?;
 
