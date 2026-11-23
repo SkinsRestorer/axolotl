@@ -8,7 +8,7 @@ use std::{
 use axum::body::Bytes;
 use reqwest::{
     Client, RequestBuilder, StatusCode,
-    header::{AUTHORIZATION, HeaderValue},
+    header::{AUTHORIZATION, HeaderValue, RETRY_AFTER},
     multipart::{Form, Part},
 };
 use serde_json::Value;
@@ -29,8 +29,7 @@ use crate::{
 };
 
 use super::models::{
-    Cape, JobDetails, JobStatus, JobSuccessResponse, MineSkinErrorItem, MineSkinResponse,
-    SanitizedResponse,
+    Cape, JobStatus, JobSuccessResponse, MineSkinErrorItem, MineSkinResponse, SanitizedResponse,
 };
 
 const MINESKIN_USER_AGENT: &str = "Axolotl-MineSkin-Proxy/1.0";
@@ -132,11 +131,18 @@ impl MineSkinClient {
         Ok((response, errors))
     }
 
+    /// Waits until a job completes. A job that `MineSkin` already completed
+    /// when it was queued returns at once, without a status request.
     pub async fn poll_job(
         &self,
-        job_id: &str,
+        job: impl Into<EnqueuedJob>,
         poll_interval: Duration,
     ) -> Result<SanitizedResponse, MineSkinClientError> {
+        let job = job.into();
+        if let Some(response) = job.completed {
+            return Ok(response);
+        }
+        let job_id = job.id.as_str();
         // MineSkin rate limits job lookups and asks for at most one per second.
         // Shorter waitMs values stay valid for compatibility but poll at the floor.
         let poll_interval = poll_interval.max(self.minimum_poll_interval);
@@ -169,8 +175,9 @@ impl MineSkinClient {
                             job_id, "Retrying MineSkin job status after a transient error"
                         );
                         // Back off so a rate-limited or failing MineSkin is not polled
-                        // at the client's chosen interval.
-                        sleep(retry_delay).await;
+                        // at the client's chosen interval, and wait at least as
+                        // long as MineSkin asked.
+                        sleep(transient_retry_sleep(retry_delay, error.retry_after())).await;
                         retry_delay = retry_delay
                             .saturating_mul(2)
                             .min(MAXIMUM_POLL_RETRY_DELAY)
@@ -236,7 +243,9 @@ impl MineSkinClient {
             .map_err(|message| MineSkinClientError::unexpected("MineSkin job response", message))
     }
 
-    pub async fn enqueue(&self, upload: UploadPayload) -> Result<JobDetails, MineSkinClientError> {
+    /// Queues a skin upload. For a skin that `MineSkin` already knows, it
+    /// returns the completed job at once, and the result keeps it.
+    pub async fn enqueue(&self, upload: UploadPayload) -> Result<EnqueuedJob, MineSkinClientError> {
         let file_length = u64::try_from(upload.file.len()).map_err(|error| {
             tracing::debug!(%error, "Skin file length exceeds the multipart limit");
             MineSkinClientError::InvalidUpload("Skin file is too large".to_owned())
@@ -271,14 +280,31 @@ impl MineSkinClient {
             .execute(request, "MineSkin job enqueue response")
             .await?;
 
-        if let Some(job) = response.job.take() {
-            Ok(job)
-        } else {
-            Err(MineSkinClientError::upstream(
+        let Some(job) = response.job.take() else {
+            return Err(MineSkinClientError::upstream(
                 StatusCode::BAD_GATEWAY,
                 response.into_error_message(),
-            ))
-        }
+            ));
+        };
+        let response = JobSuccessResponse {
+            job,
+            skin: response.skin.take(),
+            warnings: response.warnings.take(),
+            messages: response.messages.take(),
+        };
+        let id = response.job.id.clone();
+        // Anything short of a usable skin is left to the status poll, which
+        // reports it as usual.
+        let completed = if response.job.status == JobStatus::Completed
+            && response.validate().is_ok()
+            && response.skin_uuid().is_some()
+        {
+            Some(self.sanitize_job(response)?)
+        } else {
+            None
+        };
+
+        Ok(EnqueuedJob { id, completed })
     }
 
     pub async fn supported_capes(&self) -> Result<Arc<[Cape]>, MineSkinClientError> {
@@ -496,6 +522,7 @@ impl MineSkinClient {
         let result = async {
             let response = request.send().await.map_err(MineSkinClientError::Request)?;
             let status = response.status();
+            let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
             let mut body = Vec::new();
             let mut response = response;
             while let Some(chunk) = response
@@ -516,10 +543,9 @@ impl MineSkinClient {
                 body.extend_from_slice(&chunk);
             }
 
-            self.metrics.record_mineskin_response_bytes(body.len());
             let buffered = BufferedResponse { status, body };
             if !status.is_success() {
-                return Err(parse_error_response(context, &buffered));
+                return Err(parse_error_response(context, &buffered, retry_after));
             }
             let response = parse_response(context, &buffered)?;
             if response.success == Some(false) {
@@ -542,6 +568,24 @@ impl MineSkinClient {
             == Some(StatusCode::TOO_MANY_REQUESTS);
         record.outcome = Some((result.is_err(), rate_limited));
         result
+    }
+}
+
+/// A job that `MineSkin` accepted. `MineSkin` completes a duplicate skin as
+/// soon as it is queued, so such a job already holds its result. A job built
+/// from an ID alone has no result yet.
+#[derive(Debug)]
+pub struct EnqueuedJob {
+    pub id: String,
+    completed: Option<SanitizedResponse>,
+}
+
+impl From<&str> for EnqueuedJob {
+    fn from(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            completed: None,
+        }
     }
 }
 
@@ -586,6 +630,7 @@ struct CachedFailure {
     configuration_error: bool,
     upstream_status: StatusCode,
     message: String,
+    retry_after: Option<Duration>,
 }
 
 impl CachedFailure {
@@ -605,6 +650,7 @@ impl CachedFailure {
             configuration_error: error.is_configuration_error(),
             upstream_status: error.upstream_status().unwrap_or(StatusCode::BAD_GATEWAY),
             message,
+            retry_after: error.retry_after(),
         }
     }
 
@@ -617,7 +663,13 @@ impl CachedFailure {
             return MineSkinClientError::Configuration(self.message.clone());
         }
 
+        // Count down the wait that MineSkin asked for, so a repeated error
+        // does not ask clients to wait longer than MineSkin did.
+        let retry_after = self
+            .retry_after
+            .map(|delay| delay.saturating_sub(self.failed_at.elapsed()));
         MineSkinClientError::upstream(self.upstream_status, self.message.clone())
+            .with_retry_after(retry_after)
     }
 }
 
@@ -665,8 +717,12 @@ fn parse_response(
 
 /// Keeps the upstream status even when a proxy or CDN in front of `MineSkin`
 /// returns an error page that is not JSON.
-fn parse_error_response(context: &'static str, response: &BufferedResponse) -> MineSkinClientError {
-    match serde_json::from_slice::<MineSkinResponse>(&response.body) {
+fn parse_error_response(
+    context: &'static str,
+    response: &BufferedResponse,
+    retry_after: Option<Duration>,
+) -> MineSkinClientError {
+    let error = match serde_json::from_slice::<MineSkinResponse>(&response.body) {
         Ok(body) => MineSkinClientError::upstream(response.status, body.into_error_message()),
         Err(source) => {
             warn!(
@@ -681,7 +737,15 @@ fn parse_error_response(context: &'static str, response: &BufferedResponse) -> M
                 format!("MineSkin request failed with status {}", response.status),
             )
         }
-    }
+    };
+    error.with_retry_after(retry_after)
+}
+
+/// Reads a `Retry-After` header in seconds, the form that `MineSkin` sends.
+/// An HTTP date or a negative value counts as no header.
+fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+    let seconds = value?.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 /// Records a `MineSkin` call when dropped. A call cancelled by a deadline or a
@@ -699,6 +763,17 @@ impl Drop for CallRecord<'_> {
         self.metrics
             .finish_mineskin_request(self.started_at.elapsed(), failed, rate_limited);
     }
+}
+
+/// Returns how long to wait before retrying a job status request: the current
+/// backoff, or `MineSkin`'s `Retry-After` when that is longer. `Retry-After` is
+/// capped at the maximum backoff, so one large value cannot stall the upload.
+fn transient_retry_sleep(backoff: Duration, retry_after: Option<Duration>) -> Duration {
+    backoff.max(
+        retry_after
+            .unwrap_or_default()
+            .min(MAXIMUM_POLL_RETRY_DELAY),
+    )
 }
 
 /// Builds the error for a failed job from `MineSkin`'s first error message.
@@ -759,7 +834,13 @@ pub enum MineSkinClientError {
         message: String,
     },
     #[error("{message}")]
-    Upstream { status: StatusCode, message: String },
+    Upstream {
+        status: StatusCode,
+        message: String,
+        /// How long `MineSkin` asked the proxy to wait, from its `Retry-After`
+        /// header.
+        retry_after: Option<Duration>,
+    },
     #[error("{0}")]
     Crypto(#[source] crate::crypto::CryptoError),
     #[error("{0}")]
@@ -771,7 +852,30 @@ impl MineSkinClientError {
         Self::Upstream {
             status,
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    /// Returns how long `MineSkin` asked the proxy to wait before the next
+    /// request, from the `Retry-After` header of its error response. `MineSkin`
+    /// sends it with rate limit errors.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Upstream { retry_after, .. } => *retry_after,
+            Self::Configuration(_)
+            | Self::Request(_)
+            | Self::UnexpectedResponse { .. }
+            | Self::Crypto(_)
+            | Self::InvalidUpload(_) => None,
+        }
+    }
+
+    fn with_retry_after(mut self, value: Option<Duration>) -> Self {
+        if let Self::Upstream { retry_after, .. } = &mut self {
+            *retry_after = value;
+        }
+        self
     }
 
     fn unexpected(context: &'static str, message: impl Into<String>) -> Self {
@@ -1054,7 +1158,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(MineSkinClientError::Upstream { status: StatusCode::NOT_FOUND, ref message })
+            Err(MineSkinClientError::Upstream { status: StatusCode::NOT_FOUND, ref message, .. })
                 if message == "Job not found"
         ));
         server.verify().await;
@@ -1129,7 +1233,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(MineSkinClientError::Upstream { status: StatusCode::BAD_GATEWAY, ref message })
+            Err(MineSkinClientError::Upstream { status: StatusCode::BAD_GATEWAY, ref message, .. })
                 if message == "Invalid skin image"
         ));
         server.verify().await;
@@ -1154,7 +1258,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(MineSkinClientError::Upstream { status: StatusCode::BAD_GATEWAY, ref message })
+            Err(MineSkinClientError::Upstream { status: StatusCode::BAD_GATEWAY, ref message, .. })
                 if message == "MineSkin job failed to complete"
         ));
         server.verify().await;
@@ -1343,7 +1447,8 @@ mod tests {
                 result,
                 Err(MineSkinClientError::Upstream {
                     status: StatusCode::SERVICE_UNAVAILABLE,
-                    ref message
+                    ref message,
+                    ..
                 }) if message == "maintenance"
             ));
         }
@@ -1549,5 +1654,194 @@ mod tests {
             "the cancelled call counts as failed"
         );
         Ok(())
+    }
+
+    fn skin_upload() -> UploadPayload {
+        UploadPayload {
+            file: Bytes::from_static(b"png-bytes"),
+            file_name: Some("skin.png".to_owned()),
+            content_type: Some("image/png".to_owned()),
+            variant: "classic".to_owned(),
+            name: None,
+            cape_uuid: CAPE_UUID.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_a_duplicate_skin_from_the_queue_response_without_polling() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/queue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "messages": [{ "code": "skin_found", "message": "Found existing skin" }],
+                "job": { "id": "job-poll", "status": "completed", "result": SKIN_UUID },
+                "skin": { "uuid": SKIN_UUID, "duplicate": true }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(completed_job())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = poll_test_client(&server, Duration::from_secs(5))?;
+
+        let job = client.enqueue(skin_upload()).await?;
+        assert_eq!(job.id, "job-poll");
+        let response = client.poll_job(job, Duration::ZERO).await?;
+
+        assert!(response.skin.is_some());
+        assert_eq!(response.job.id, "job-poll");
+        assert_eq!(response.job.status, JobStatus::Completed);
+        assert_eq!(
+            response
+                .messages
+                .first()
+                .and_then(|item| item.code.as_deref()),
+            Some("skin_found")
+        );
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn polls_a_queued_job_that_is_not_complete_yet() -> TestResult {
+        // A "completed" job without a skin is left to the poll, which owns the
+        // error handling for it.
+        for job in [
+            json!({ "id": "job-poll", "status": "waiting" }),
+            json!({ "id": "job-poll", "status": "completed" }),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/queue"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "success": true, "job": job })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            mount_job_response(&server, 1, completed_job()).await;
+            let client = poll_test_client(&server, Duration::from_secs(5))?;
+
+            let job = client.enqueue(skin_upload()).await?;
+            let response = client.poll_job(job, Duration::ZERO).await?;
+
+            assert!(response.skin.is_some());
+            server.verify().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exposes_the_retry_after_header_of_a_rate_limit() -> TestResult {
+        for (header, expected) in [
+            (Some("7"), Some(Duration::from_secs(7))),
+            (Some(" 0 "), Some(Duration::ZERO)),
+            (Some("-1"), None),
+            (Some("Wed, 21 Oct 2015 07:28:00 GMT"), None),
+            (None, None),
+        ] {
+            let server = MockServer::start().await;
+            let mut response = ResponseTemplate::new(429).set_body_json(json!({
+                "success": false,
+                "errors": [{ "code": "rate_limit", "message": "request too soon" }]
+            }));
+            if let Some(header) = header {
+                response = response.insert_header("Retry-After", header);
+            }
+            mount_job_response(&server, 1, response).await;
+            let client = poll_test_client(&server, Duration::from_secs(5))?;
+
+            let error = client
+                .fetch_job("job-poll")
+                .await
+                .expect_err("a 429 should fail the request");
+
+            assert_eq!(error.upstream_status(), Some(StatusCode::TOO_MANY_REQUESTS));
+            assert_eq!(error.retry_after(), expected, "header {header:?}");
+            server.verify().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeats_a_cached_rate_limit_with_the_remaining_retry_after() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/me"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "30")
+                    .set_body_json(json!({ "success": false })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = cache_test_client(&server.uri())?;
+
+        let first = client
+            .has_cape_grant()
+            .await
+            .expect_err("the rate limit should fail the lookup");
+        let cached = client
+            .has_cape_grant()
+            .await
+            .expect_err("the cached rate limit should fail the lookup");
+
+        assert_eq!(first.retry_after(), Some(Duration::from_secs(30)));
+        let remaining = cached
+            .retry_after()
+            .ok_or("the cached error lost its Retry-After")?;
+        assert!(remaining <= Duration::from_secs(30), "{remaining:?}");
+        assert!(remaining > Duration::from_secs(25), "{remaining:?}");
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waits_for_retry_after_before_polling_a_rate_limited_job_again() -> TestResult {
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_json(json!({ "success": false })),
+        )
+        .await;
+        mount_job_response(&server, 2, completed_job()).await;
+        let client = poll_test_client(&server, Duration::from_secs(5))?;
+
+        let started = Instant::now();
+        client.poll_job("job-poll", Duration::ZERO).await?;
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the poll must wait as long as MineSkin asked"
+        );
+        server.verify().await;
+        Ok(())
+    }
+
+    #[test]
+    fn caps_the_retry_after_wait_at_the_maximum_backoff() {
+        let backoff = Duration::from_millis(500);
+        assert_eq!(transient_retry_sleep(backoff, None), backoff);
+        assert_eq!(
+            transient_retry_sleep(backoff, Some(Duration::from_millis(100))),
+            backoff
+        );
+        assert_eq!(
+            transient_retry_sleep(backoff, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            transient_retry_sleep(backoff, Some(Duration::from_secs(45))),
+            MAXIMUM_POLL_RETRY_DELAY
+        );
     }
 }

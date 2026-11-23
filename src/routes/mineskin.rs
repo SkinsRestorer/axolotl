@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     app::AppState,
     crypto::{CryptoError, UrlCipher},
-    error::{ApiError, ErrorResponse},
+    error::{ApiError, ErrorCode, ErrorResponse},
     mineskin::{
         CapeSupportResponse, CapesResponse, MineSkinClientError, SanitizedResponse, UploadPayload,
     },
@@ -121,14 +121,14 @@ Defaults to 1000.",
     request_body(content = UploadRequest, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "The skin was generated. `skin.url` is the encrypted skin URL.", body = SanitizedResponse),
-        (status = 400, description = "A form field or `waitMs` is invalid, the cape is not supported, or MineSkin rejected the skin.", body = ErrorResponse),
-        (status = 408, description = "The upload body was not received in time.", body = ErrorResponse),
-        (status = 413, description = "The skin file or the upload body exceeds the size limit.", body = ErrorResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited.", body = ErrorResponse),
-        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key.", body = ErrorResponse),
-        (status = 502, description = "MineSkin returned an error or an unreadable response, or the job failed.", body = ErrorResponse),
-        (status = 503, description = "Too many uploads are in progress. Retry later.", body = ErrorResponse),
-        (status = 504, description = "MineSkin did not finish the job in time, or the upload exceeded its execution deadline.", body = ErrorResponse)
+        (status = 400, description = "A form field or `waitMs` is invalid, the cape is not supported, or MineSkin rejected the skin. Codes: `invalid_wait_ms`, `invalid_upload`, `unsupported_cape`.", body = ErrorResponse),
+        (status = 408, description = "The upload body was not received in time. Code: `upload_body_timeout`.", body = ErrorResponse),
+        (status = 413, description = "The skin file or the upload body exceeds the size limit. Code: `payload_too_large`.", body = ErrorResponse),
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
+        (status = 502, description = "MineSkin returned an error or an unreadable response, or the job failed. Code: `mineskin_error`.", body = ErrorResponse),
+        (status = 503, description = "Too many uploads are in progress. Retry later. Code: `upload_busy`.", body = ErrorResponse),
+        (status = 504, description = "MineSkin did not finish the job in time (code `job_timeout`), or the upload exceeded its execution deadline (code `upload_timeout`).", body = ErrorResponse)
     )
 )]
 pub async fn upload_skin(
@@ -137,8 +137,7 @@ pub async fn upload_skin(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
     // waitMs is the only query parameter, so any rejection means it is invalid.
-    let Query(query) =
-        query.map_err(|error| ApiError::bad_request(INVALID_WAIT_MS_MESSAGE).with_source(error))?;
+    let Query(query) = query.map_err(|error| invalid_wait_ms().with_source(error))?;
     let poll_interval = match query.wait_ms {
         Some(wait_ms) => validate_poll_interval(wait_ms)?,
         None => state.mineskin.default_poll_interval(),
@@ -146,13 +145,15 @@ pub async fn upload_skin(
     let upload = timeout(
         state.upload_body_timeout,
         parse_upload(multipart.map_err(|error| {
-            ApiError::bad_request("Content-Type must be multipart/form-data with a boundary")
+            invalid_upload("Content-Type must be multipart/form-data with a boundary")
                 .with_source(error)
         })?),
     )
     .await
     .map_err(|error| {
-        ApiError::new(StatusCode::REQUEST_TIMEOUT, "Skin upload body timed out").with_source(error)
+        ApiError::new(StatusCode::REQUEST_TIMEOUT, "Skin upload body timed out")
+            .with_code(ErrorCode::UploadBodyTimeout)
+            .with_source(error)
     })??;
     ensure_url_encryption(&state.cipher)?;
 
@@ -165,7 +166,8 @@ pub async fn upload_skin(
         .iter()
         .any(|cape| cape.uuid == upload.cape_uuid)
     {
-        return Err(ApiError::bad_request("Requested cape is not supported"));
+        return Err(ApiError::bad_request("Requested cape is not supported")
+            .with_code(ErrorCode::UnsupportedCape));
     }
 
     let job = state
@@ -175,7 +177,7 @@ pub async fn upload_skin(
         .map_err(map_enqueue_error)?;
     let response = state
         .mineskin
-        .poll_job(&job.id, poll_interval)
+        .poll_job(job, poll_interval)
         .await
         .map_err(map_upload_error)?;
 
@@ -198,21 +200,20 @@ pub async fn upload_skin(
     ),
     responses(
         (status = 200, description = "The job exists. `skin` is null until the job completes, then `skin.url` is the encrypted skin URL.", body = SanitizedResponse),
-        (status = 400, description = "The job ID is invalid.", body = ErrorResponse),
-        (status = 404, description = "MineSkin has no job with this ID.", body = ErrorResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited.", body = ErrorResponse),
-        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key.", body = ErrorResponse),
-        (status = 502, description = "MineSkin returned an error or an unreadable response, or the job failed.", body = ErrorResponse)
+        (status = 400, description = "The job ID is invalid. Code: `invalid_job_id`.", body = ErrorResponse),
+        (status = 404, description = "MineSkin has no job with this ID. Code: `job_not_found`.", body = ErrorResponse),
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
+        (status = 502, description = "MineSkin returned an error or an unreadable response, or the job failed. Code: `mineskin_error`.", body = ErrorResponse)
     )
 )]
 pub async fn job_status(
     State(state): State<Arc<AppState>>,
     path: Result<Path<JobPath>, PathRejection>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
-    let Path(path) =
-        path.map_err(|error| ApiError::bad_request(INVALID_JOB_ID_MESSAGE).with_source(error))?;
+    let Path(path) = path.map_err(|error| invalid_job_id().with_source(error))?;
     if !is_valid_job_id(&path.job_id) {
-        return Err(ApiError::bad_request(INVALID_JOB_ID_MESSAGE));
+        return Err(invalid_job_id());
     }
 
     let job = state
@@ -234,9 +235,9 @@ pub async fn job_status(
 `capeUuid` when uploading. The list is cached, and a stale list is served while MineSkin fails.",
     responses(
         (status = 200, description = "The supported capes.", body = CapesResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited.", body = ErrorResponse),
-        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key.", body = ErrorResponse),
-        (status = 502, description = "MineSkin returned an error or an unreadable response.", body = ErrorResponse)
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
+        (status = 502, description = "MineSkin returned an error or an unreadable response. Code: `mineskin_error`.", body = ErrorResponse)
     )
 )]
 pub async fn supported_capes(
@@ -260,9 +261,9 @@ pub async fn supported_capes(
 `GET /mineskin/capes`.",
     responses(
         (status = 200, description = "Whether the account may use capes, and the supported capes.", body = CapeSupportResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited.", body = ErrorResponse),
-        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key.", body = ErrorResponse),
-        (status = 502, description = "MineSkin returned an error or an unreadable response.", body = ErrorResponse)
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
+        (status = 502, description = "MineSkin returned an error or an unreadable response. Code: `mineskin_error`.", body = ErrorResponse)
     )
 )]
 pub async fn cape_support(
@@ -306,8 +307,8 @@ pub async fn cape_support(
     ),
     responses(
         (status = 200, description = "The decrypted MineSkin URL.", body = DecryptedUrlResponse),
-        (status = 400, description = "`encryptedUrl` is missing, repeated, or not a URL that this proxy encrypted.", body = ErrorResponse),
-        (status = 500, description = "The proxy has no AES secret key.", body = ErrorResponse)
+        (status = 400, description = "`encryptedUrl` is missing, repeated, or not a URL that this proxy encrypted. Code: `invalid_encrypted_url`.", body = ErrorResponse),
+        (status = 500, description = "The proxy has no AES secret key. Code: `not_configured`.", body = ErrorResponse)
     )
 )]
 pub async fn decrypt_url(
@@ -316,19 +317,25 @@ pub async fn decrypt_url(
 ) -> Result<Json<DecryptedUrlResponse>, ApiError> {
     let Query(query) = query.map_err(|error| {
         // encryptedUrl is the only parameter, so it is missing or repeated.
-        ApiError::bad_request("encryptedUrl must be provided exactly once").with_source(error)
+        ApiError::bad_request("encryptedUrl must be provided exactly once")
+            .with_code(ErrorCode::InvalidEncryptedUrl)
+            .with_source(error)
     })?;
     let url = state
         .cipher
         .decrypt_url(&query.encrypted_url)
         .map_err(|error| match error {
-            CryptoError::MissingConfiguration => ApiError::internal(error.to_string()),
+            CryptoError::MissingConfiguration => {
+                ApiError::internal(error.to_string()).with_code(ErrorCode::NotConfigured)
+            }
             CryptoError::InvalidFormat
             | CryptoError::InvalidPayload
             | CryptoError::UnsupportedUrl
             | CryptoError::InvalidUuid
             | CryptoError::Encryption
-            | CryptoError::Randomness => ApiError::bad_request(error.to_string()),
+            | CryptoError::Randomness => {
+                ApiError::bad_request(error.to_string()).with_code(ErrorCode::InvalidEncryptedUrl)
+            }
         })?;
 
     Ok(Json(DecryptedUrlResponse { url }))
@@ -353,13 +360,14 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
                 let content_type = field.content_type().map(str::to_owned);
                 let bytes = field.bytes().await.map_err(map_multipart_error)?;
                 if bytes.is_empty() {
-                    return Err(ApiError::bad_request("A skin file must be provided"));
+                    return Err(invalid_upload("A skin file must be provided"));
                 }
                 if bytes.len() > MAXIMUM_FILE_SIZE {
                     return Err(ApiError::new(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         "Skin file must not exceed 5 MiB",
-                    ));
+                    )
+                    .with_code(ErrorCode::PayloadTooLarge));
                 }
                 file = Some((bytes, file_name, content_type));
             }
@@ -380,13 +388,13 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
     }
 
     let (file, file_name, content_type) =
-        file.ok_or_else(|| ApiError::bad_request("A skin file must be provided"))?;
+        file.ok_or_else(|| invalid_upload("A skin file must be provided"))?;
     let variant = variant
         .filter(|value| matches!(value.as_str(), "classic" | "slim"))
-        .ok_or_else(|| ApiError::bad_request("variant must be one of classic or slim"))?;
+        .ok_or_else(|| invalid_upload("variant must be one of classic or slim"))?;
     let name = name.map(|value| value.trim().to_owned());
     if name.as_ref().is_some_and(String::is_empty) {
-        return Err(ApiError::bad_request("name must not be blank"));
+        return Err(invalid_upload("name must not be blank"));
     }
     // MineSkin rejects other names with a generic "Validation error", so check
     // its rule here and say what is wrong.
@@ -396,14 +404,14 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
                 byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b' ')
             })
     }) {
-        return Err(ApiError::bad_request(INVALID_NAME_MESSAGE));
+        return Err(invalid_upload(INVALID_NAME_MESSAGE));
     }
 
     let cape_uuid = cape_uuid
         .or(cape_alias)
-        .ok_or_else(|| ApiError::bad_request("capeUuid is required"))?;
+        .ok_or_else(|| invalid_upload("capeUuid is required"))?;
     let cape_uuid = Uuid::parse_str(&cape_uuid)
-        .map_err(|error| ApiError::bad_request("capeUuid must be a valid UUID").with_source(error))?
+        .map_err(|error| invalid_upload("capeUuid must be a valid UUID").with_source(error))?
         .hyphenated()
         .to_string();
 
@@ -427,10 +435,23 @@ fn map_multipart_error(error: MultipartError) -> ApiError {
             StatusCode::PAYLOAD_TOO_LARGE,
             "Skin upload body exceeds the size limit",
         )
+        .with_code(ErrorCode::PayloadTooLarge)
         .with_source(error);
     }
 
-    ApiError::bad_request("Failed to parse multipart form data").with_source(error)
+    invalid_upload("Failed to parse multipart form data").with_source(error)
+}
+
+fn invalid_upload(message: &str) -> ApiError {
+    ApiError::bad_request(message).with_code(ErrorCode::InvalidUpload)
+}
+
+fn invalid_wait_ms() -> ApiError {
+    ApiError::bad_request(INVALID_WAIT_MS_MESSAGE).with_code(ErrorCode::InvalidWaitMs)
+}
+
+fn invalid_job_id() -> ApiError {
+    ApiError::bad_request(INVALID_JOB_ID_MESSAGE).with_code(ErrorCode::InvalidJobId)
 }
 
 /// Fails when the skin URL could not be encrypted. Checked before queueing, because
@@ -438,7 +459,9 @@ fn map_multipart_error(error: MultipartError) -> ApiError {
 fn ensure_url_encryption(cipher: &UrlCipher) -> Result<(), ApiError> {
     match cipher.encrypt_uuid(ENCRYPTION_PROBE_SKIN_ID) {
         Err(error @ CryptoError::MissingConfiguration) => {
-            Err(ApiError::internal(error.to_string()).with_source(error))
+            Err(ApiError::internal(error.to_string())
+                .with_code(ErrorCode::NotConfigured)
+                .with_source(error))
         }
         _ => Ok(()),
     }
@@ -455,7 +478,7 @@ fn is_valid_job_id(job_id: &str) -> bool {
 
 fn validate_poll_interval(milliseconds: u64) -> Result<Duration, ApiError> {
     if !(MINIMUM_POLL_INTERVAL_MS..=MAXIMUM_POLL_INTERVAL_MS).contains(&milliseconds) {
-        return Err(ApiError::bad_request(INVALID_WAIT_MS_MESSAGE));
+        return Err(invalid_wait_ms());
     }
 
     Ok(Duration::from_millis(milliseconds))
@@ -527,9 +550,21 @@ fn map_proxy_error(error: MineSkinClientError) -> ApiError {
 fn mineskin_error(error: MineSkinClientError, status: StatusCode) -> ApiError {
     // A 429 comes from the proxy's shared MineSkin account, not the client, so
     // operators need to see it even though it is a 4xx.
-    if status == StatusCode::TOO_MANY_REQUESTS {
+    // MineSkin's Retry-After, if any, is forwarded so clients wait as long.
+    let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
         warn!(%error, "MineSkin rate limit reached");
-    }
+        error.retry_after()
+    } else {
+        None
+    };
+    let code = match status {
+        StatusCode::BAD_REQUEST => ErrorCode::InvalidUpload,
+        StatusCode::NOT_FOUND => ErrorCode::JobNotFound,
+        StatusCode::TOO_MANY_REQUESTS => ErrorCode::MineskinRateLimited,
+        StatusCode::GATEWAY_TIMEOUT => ErrorCode::JobTimeout,
+        StatusCode::INTERNAL_SERVER_ERROR => ErrorCode::NotConfigured,
+        _ => ErrorCode::MineskinError,
+    };
     let message = match &error {
         MineSkinClientError::Request(_) => "MineSkin request failed".to_owned(),
         MineSkinClientError::Configuration(_)
@@ -539,7 +574,12 @@ fn mineskin_error(error: MineSkinClientError, status: StatusCode) -> ApiError {
         | MineSkinClientError::InvalidUpload(_) => error.to_string(),
     };
 
-    ApiError::new(status, message).with_source(error)
+    let api_error = ApiError::new(status, message).with_code(code);
+    let api_error = match retry_after {
+        Some(delay) => api_error.with_retry_after(delay),
+        None => api_error,
+    };
+    api_error.with_source(error)
 }
 
 #[cfg(test)]
@@ -550,10 +590,13 @@ fn mineskin_error(error: MineSkinClientError, status: StatusCode) -> ApiError {
 mod tests {
     use std::sync::Arc;
 
+    use std::time::Duration;
+
     use axum::{
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use futures_util::stream;
     use serde_json::{Value, json};
     use tower::ServiceExt;
     use url::Url;
@@ -601,8 +644,80 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
-        assert_eq!(body, json!({ "error": "URL encryption is not configured" }));
+        assert_eq!(
+            body,
+            json!({ "error": "URL encryption is not configured", "code": "not_configured" })
+        );
         server.verify().await;
+        Ok(())
+    }
+
+    async fn body_json(
+        response: axum::response::Response,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_slice(
+            &to_bytes(response.into_body(), 4096).await?,
+        )?)
+    }
+
+    #[tokio::test]
+    async fn reports_not_configured_when_a_secret_is_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AppConfig::for_tests(Url::parse("http://127.0.0.1:9/v2/")?);
+        config.mineskin_api_key = None;
+        config.aes_secret_key = None;
+        let app = build_app(&config, Arc::new(Metrics::default()))?;
+
+        let capes = app
+            .clone()
+            .oneshot(Request::get("/mineskin/capes").body(Body::empty())?)
+            .await?;
+        let decrypted = app
+            .oneshot(
+                Request::get(
+                    "/mineskin/decrypt-url?encryptedUrl=skinsrestorer-axolotl%3A%2F%2Fv2%2Fx",
+                )
+                .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(capes.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body_json(capes).await?,
+            json!({ "error": "MineSkin API key is missing or invalid", "code": "not_configured" })
+        );
+        assert_eq!(decrypted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body_json(decrypted).await?,
+            json!({ "error": "URL encryption is not configured", "code": "not_configured" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_an_upload_body_timeout_with_its_own_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AppConfig::for_tests(Url::parse("http://127.0.0.1:9/v2/")?);
+        config.request_timeout = Duration::from_millis(50);
+        let app = build_app(&config, Arc::new(Metrics::default()))?;
+        let pending_body = stream::pending::<Result<Bytes, std::io::Error>>();
+
+        let response = app
+            .oneshot(
+                Request::post("/mineskin/skins")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=axolotl-pending",
+                    )
+                    .body(Body::from_stream(pending_body))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            body_json(response).await?,
+            json!({ "error": "Skin upload body timed out", "code": "upload_body_timeout" })
+        );
         Ok(())
     }
 }

@@ -29,8 +29,11 @@ pub struct JobDetails {
     pub result: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+/// State of a `MineSkin` job. `unknown` stands for any state that `MineSkin`
+/// added after this proxy was built; treat it like a pending job.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
+#[schema(example = "completed")]
 pub enum JobStatus {
     Waiting,
     Active,
@@ -77,6 +80,10 @@ impl JobSuccessResponse {
             skin,
             warnings: self.warnings.unwrap_or_default(),
             messages: self.messages.unwrap_or_default(),
+            job: SanitizedJob {
+                id: self.job.id,
+                status: self.job.status,
+            },
         })
     }
 
@@ -163,6 +170,20 @@ pub struct SanitizedResponse {
     /// Informational messages that `MineSkin` sent about the job. Empty when
     /// there are none.
     pub messages: Vec<MineSkinErrorItem>,
+    /// The `MineSkin` job behind this response. When an upload times out,
+    /// pass `job.id` to `GET /mineskin/jobs/{jobId}` to resume.
+    pub job: SanitizedJob,
+}
+
+/// A `MineSkin` job and its state.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SanitizedJob {
+    /// `MineSkin` job ID. Use it with `GET /mineskin/jobs/{jobId}`.
+    #[schema(example = "6650a1b2c3d4e5f6a7b8c9d0")]
+    pub id: String,
+    /// Job state: `waiting`, `active`, `processing`, `completed`, `failed`
+    /// or `unknown`.
+    pub status: JobStatus,
 }
 
 /// The skin that a completed `MineSkin` job generated.
@@ -220,8 +241,8 @@ mod tests {
     use utoipa::ToSchema;
 
     use super::{
-        Cape, CapeSupportResponse, CapesResponse, MineSkinErrorItem, SanitizedResponse,
-        SanitizedSkin,
+        Cape, CapeSupportResponse, CapesResponse, JobStatus, MineSkinErrorItem, SanitizedJob,
+        SanitizedResponse, SanitizedSkin,
     };
     use crate::crypto::ENCRYPTED_URL_SCHEME;
 
@@ -234,7 +255,7 @@ mod tests {
         let schema = schema_json::<SanitizedResponse>();
         assert_eq!(
             schema.pointer("/required"),
-            Some(&json!(["success", "skin", "warnings", "messages"]))
+            Some(&json!(["success", "skin", "warnings", "messages", "job"]))
         );
         assert_eq!(
             schema.pointer("/properties/skin/oneOf/0/$ref"),
@@ -250,6 +271,10 @@ mod tests {
             skin: None,
             warnings: Vec::new(),
             messages: Vec::new(),
+            job: SanitizedJob {
+                id: "job-1".to_owned(),
+                status: JobStatus::Waiting,
+            },
         })
         .unwrap_or(Value::Null);
         assert_eq!(serialized.get("skin"), Some(&Value::Null));
@@ -280,6 +305,7 @@ mod tests {
         for (name, schema) in [
             ("SanitizedResponse", schema_json::<SanitizedResponse>()),
             ("SanitizedSkin", schema_json::<SanitizedSkin>()),
+            ("SanitizedJob", schema_json::<SanitizedJob>()),
             ("MineSkinErrorItem", schema_json::<MineSkinErrorItem>()),
             ("Cape", schema_json::<Cape>()),
             ("CapesResponse", schema_json::<CapesResponse>()),
@@ -346,5 +372,46 @@ mod tests {
         })
         .unwrap_or(Value::Null);
         assert_eq!(serialized, json!({ "hasCapeGrant": false, "capes": [] }));
+    }
+
+    #[test]
+    fn job_status_schema_lists_every_lowercase_status() {
+        let schema = schema_json::<JobStatus>();
+        let statuses = json!([
+            "waiting",
+            "active",
+            "processing",
+            "failed",
+            "completed",
+            "unknown"
+        ]);
+        assert_eq!(schema.pointer("/enum"), Some(&statuses));
+        assert_eq!(schema.pointer("/example"), Some(&json!("completed")));
+        assert!(schema.get("description").and_then(Value::as_str).is_some());
+
+        let job = schema_json::<SanitizedJob>();
+        assert_eq!(job.pointer("/required"), Some(&json!(["id", "status"])));
+        assert_eq!(
+            job.pointer("/properties/status/$ref"),
+            Some(&json!("#/components/schemas/JobStatus"))
+        );
+        assert!(job.pointer("/properties/id/example").is_some());
+    }
+
+    #[test]
+    fn serializes_upstream_job_statuses_in_lowercase() {
+        for (upstream, expected) in [
+            ("waiting", "waiting"),
+            ("active", "active"),
+            ("processing", "processing"),
+            ("completed", "completed"),
+            ("failed", "failed"),
+            ("scheduled", "unknown"),
+        ] {
+            let serialized = serde_json::from_value::<JobStatus>(json!(upstream))
+                .and_then(serde_json::to_value)
+                .ok();
+            assert_eq!(serialized, Some(json!(expected)), "{upstream}");
+        }
     }
 }
