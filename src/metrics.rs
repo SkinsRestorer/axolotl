@@ -113,6 +113,9 @@ impl Metrics {
     }
 
     pub fn finish_mineskin_request(&self, latency: Duration, failed: bool, rate_limited: bool) {
+        // Hold the snapshot lock so that a snapshot never counts this call's
+        // error or rate limit without also counting the call itself.
+        let snapshot_lock = self.lock_client_requests();
         self.mineskin_requests.fetch_add(1, Ordering::Relaxed);
         self.mineskin_latency.record(latency);
         if failed {
@@ -121,6 +124,7 @@ impl Metrics {
         if rate_limited {
             self.mineskin_rate_limits.fetch_add(1, Ordering::Relaxed);
         }
+        drop(snapshot_lock);
     }
 
     #[must_use]
@@ -482,9 +486,37 @@ impl LatencyHistogram {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, str::FromStr, time::Duration};
+    use std::{net::IpAddr, str::FromStr, sync::Arc, thread, time::Duration};
 
     use super::Metrics;
+
+    #[test]
+    fn never_snapshots_more_mineskin_errors_than_mineskin_calls() {
+        let metrics = Arc::new(Metrics::default());
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let metrics = Arc::clone(&metrics);
+                thread::spawn(move || {
+                    for _ in 0..20_000 {
+                        metrics.finish_mineskin_request(Duration::from_millis(1), true, true);
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..20_000 {
+            let snapshot = metrics.snapshot();
+            assert!(snapshot.mineskin_errors <= snapshot.mineskin_requests);
+            assert!(snapshot.mineskin_rate_limits <= snapshot.mineskin_requests);
+            assert_eq!(
+                snapshot.mineskin_latency.count(),
+                snapshot.mineskin_requests
+            );
+        }
+        for writer in writers {
+            writer.join().expect("writer thread should not panic");
+        }
+    }
 
     #[test]
     fn keeps_concurrent_client_traffic_after_acknowledging_a_report() {
