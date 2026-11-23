@@ -41,10 +41,11 @@ const CAPE_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 pub struct MineSkinClient {
     http: Client,
     base_url: Url,
-    authorization: AuthorizationHeader,
+    authorization: Option<HeaderValue>,
     cipher: UrlCipher,
     metrics: Arc<Metrics>,
     cache: CapeCache,
+    grant_cache: RwLock<Option<(bool, Instant)>>,
     default_poll_interval: Duration,
     max_poll_duration: Duration,
     cape_cache_ttl: Duration,
@@ -64,10 +65,11 @@ impl MineSkinClient {
         Ok(Self {
             http,
             base_url: config.mineskin_base_url.clone(),
-            authorization: AuthorizationHeader::new(config.mineskin_api_key.as_deref()),
+            authorization: authorization_header(config.mineskin_api_key.as_deref()),
             cipher,
             metrics,
             cache: CapeCache::default(),
+            grant_cache: RwLock::new(None),
             default_poll_interval: config.default_poll_interval,
             max_poll_duration: config.max_poll_duration,
             cape_cache_ttl: config.cape_cache_ttl,
@@ -305,7 +307,21 @@ impl MineSkinClient {
         cached.fetched_at.elapsed() < self.cape_cache_ttl
     }
 
+    /// Returns whether the account may use capes. The answer is cached for the
+    /// cape cache TTL, because grants change rarely and every call costs a
+    /// `MineSkin` request.
     pub async fn has_cape_grant(&self) -> Result<bool, MineSkinClientError> {
+        if let Some((has_grant, fetched_at)) = *self.grant_cache.read().await
+            && fetched_at.elapsed() < self.cape_cache_ttl
+        {
+            return Ok(has_grant);
+        }
+        let has_grant = self.fetch_cape_grant().await?;
+        *self.grant_cache.write().await = Some((has_grant, Instant::now()));
+        Ok(has_grant)
+    }
+
+    async fn fetch_cape_grant(&self) -> Result<bool, MineSkinClientError> {
         let url = self.endpoint("me")?;
         let request = self.authorize(self.http.get(url))?;
         let response = self.execute(request, "MineSkin account response").await?;
@@ -377,20 +393,10 @@ impl MineSkinClient {
     }
 
     fn authorize(&self, request: RequestBuilder) -> Result<RequestBuilder, MineSkinClientError> {
-        match &self.authorization {
-            AuthorizationHeader::Configured(header) => {
-                Ok(request.header(AUTHORIZATION, header.clone()))
-            }
-            AuthorizationHeader::Missing => Err(MineSkinClientError::Configuration(
-                "MineSkin API key is not configured".to_owned(),
-            )),
-            AuthorizationHeader::Empty => Err(MineSkinClientError::Configuration(
-                "MineSkin API key is empty".to_owned(),
-            )),
-            AuthorizationHeader::Invalid => Err(MineSkinClientError::Configuration(
-                "MineSkin API key contains invalid characters".to_owned(),
-            )),
-        }
+        let header = self.authorization.clone().ok_or_else(|| {
+            MineSkinClientError::Configuration("MineSkin API key is missing or invalid".to_owned())
+        })?;
+        Ok(request.header(AUTHORIZATION, header))
     }
 
     async fn execute(
@@ -503,34 +509,21 @@ impl CachedCapeFailure {
     }
 }
 
-enum AuthorizationHeader {
-    Configured(HeaderValue),
-    Missing,
-    Empty,
-    Invalid,
-}
-
-impl AuthorizationHeader {
-    fn new(api_key: Option<&str>) -> Self {
-        let Some(raw_key) = api_key else {
-            return Self::Missing;
-        };
-        let raw_key = raw_key.trim();
-        if raw_key.is_empty() || raw_key.eq_ignore_ascii_case("Bearer") {
-            return Self::Empty;
-        }
-
-        let authorization = if raw_key.starts_with("Bearer ") {
-            raw_key.to_owned()
-        } else {
-            format!("Bearer {raw_key}")
-        };
-
-        HeaderValue::from_str(&authorization).map_or(Self::Invalid, |mut header| {
-            header.set_sensitive(true);
-            Self::Configured(header)
-        })
+/// Builds the `MineSkin` authorization header. Returns `None` when the key is
+/// missing, blank, or not a valid header value; the startup warnings say which.
+fn authorization_header(api_key: Option<&str>) -> Option<HeaderValue> {
+    let raw_key = api_key?.trim();
+    if raw_key.is_empty() || raw_key.eq_ignore_ascii_case("Bearer") {
+        return None;
     }
+    let authorization = if raw_key.starts_with("Bearer ") {
+        raw_key.to_owned()
+    } else {
+        format!("Bearer {raw_key}")
+    };
+    let mut header = HeaderValue::from_str(&authorization).ok()?;
+    header.set_sensitive(true);
+    Some(header)
 }
 
 struct BufferedResponse {
@@ -803,6 +796,25 @@ mod tests {
 
         assert_eq!(url.path(), "/v2/queue/job%2Fwith%3Fsyntax");
         Ok(())
+    }
+
+    #[test]
+    fn builds_the_authorization_header_only_from_a_usable_key() {
+        for key in [None, Some(""), Some("  "), Some("Bearer"), Some("bad\nkey")] {
+            assert!(
+                authorization_header(key).is_none(),
+                "{key:?} should not produce a header"
+            );
+        }
+        for key in ["secret", " secret ", "Bearer secret"] {
+            assert_eq!(
+                authorization_header(Some(key))
+                    .and_then(|header| header.to_str().ok().map(str::to_owned))
+                    .as_deref(),
+                Some("Bearer secret"),
+                "{key:?} should produce a bearer header"
+            );
+        }
     }
 
     const SKIN_UUID: &str = "123e4567-e89b-12d3-a456-426614174002";

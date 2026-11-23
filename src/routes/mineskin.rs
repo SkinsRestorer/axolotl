@@ -13,7 +13,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -28,6 +27,7 @@ use crate::{
 
 const MINIMUM_POLL_INTERVAL_MS: u64 = 250;
 const MAXIMUM_POLL_INTERVAL_MS: u64 = 10_000;
+const INVALID_WAIT_MS_MESSAGE: &str = "waitMs must be an integer between 250 and 10000";
 const MAXIMUM_FILE_SIZE: usize = 5 * 1024 * 1024;
 const MAXIMUM_JOB_ID_LENGTH: usize = 64;
 const INVALID_JOB_ID_MESSAGE: &str =
@@ -110,7 +110,9 @@ pub async fn upload_skin(
     query: Result<Query<UploadQuery>, QueryRejection>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
-    let Query(query) = query.map_err(|error| ApiError::bad_request(error.body_text()))?;
+    // waitMs is the only query parameter, so any rejection means it is invalid.
+    let Query(query) =
+        query.map_err(|error| ApiError::bad_request(INVALID_WAIT_MS_MESSAGE).with_source(error))?;
     let poll_interval = match query.wait_ms {
         Some(wait_ms) => validate_poll_interval(wait_ms)?,
         None => state.mineskin.default_poll_interval(),
@@ -130,7 +132,7 @@ pub async fn upload_skin(
         .mineskin
         .supported_capes()
         .await
-        .map_err(|error| map_upload_error(&error))?;
+        .map_err(map_upload_error)?;
     if !supported_capes
         .iter()
         .any(|cape| cape.uuid == upload.cape_uuid)
@@ -142,12 +144,12 @@ pub async fn upload_skin(
         .mineskin
         .enqueue(upload)
         .await
-        .map_err(|error| map_upload_error(&error))?;
+        .map_err(map_upload_error)?;
     let response = state
         .mineskin
         .poll_job(&job.id, poll_interval)
         .await
-        .map_err(|error| map_upload_error(&error))?;
+        .map_err(map_upload_error)?;
 
     Ok(Json(response))
 }
@@ -188,11 +190,8 @@ pub async fn job_status(
         .mineskin
         .fetch_job(&path.job_id)
         .await
-        .map_err(|error| map_job_error(&error))?;
-    let response = state
-        .mineskin
-        .sanitize_job(job)
-        .map_err(|error| map_job_error(&error))?;
+        .map_err(map_job_error)?;
+    let response = state.mineskin.sanitize_job(job).map_err(map_job_error)?;
 
     Ok(Json(response))
 }
@@ -216,7 +215,7 @@ pub async fn supported_capes(
         .mineskin
         .supported_capes()
         .await
-        .map_err(|error| map_proxy_error(&error))?;
+        .map_err(map_proxy_error)?;
 
     Ok(Json(CapesResponse { capes }))
 }
@@ -236,16 +235,26 @@ pub async fn supported_capes(
 pub async fn cape_support(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CapeSupportResponse>, ApiError> {
-    let (grant, capes) = tokio::join!(
-        state.mineskin.has_cape_grant(),
-        state.mineskin.supported_capes()
-    );
-    let has_cape_grant = grant.map_err(|error| map_proxy_error(&error))?;
-    let capes = capes.map_err(|error| map_proxy_error(&error))?;
+    // Without a grant the capes are not returned, so do not fetch them: a cape
+    // list failure would otherwise fail the whole response for nothing.
+    let has_cape_grant = state
+        .mineskin
+        .has_cape_grant()
+        .await
+        .map_err(map_proxy_error)?;
+    let capes = if has_cape_grant {
+        state
+            .mineskin
+            .supported_capes()
+            .await
+            .map_err(map_proxy_error)?
+    } else {
+        Arc::from([])
+    };
 
     Ok(Json(CapeSupportResponse {
         has_cape_grant,
-        capes: if has_cape_grant { capes } else { Arc::from([]) },
+        capes,
     }))
 }
 
@@ -388,19 +397,17 @@ fn is_valid_job_id(job_id: &str) -> bool {
 
 fn validate_poll_interval(milliseconds: u64) -> Result<Duration, ApiError> {
     if !(MINIMUM_POLL_INTERVAL_MS..=MAXIMUM_POLL_INTERVAL_MS).contains(&milliseconds) {
-        return Err(ApiError::bad_request(
-            "waitMs must be between 250 and 10000",
-        ));
+        return Err(ApiError::bad_request(INVALID_WAIT_MS_MESSAGE));
     }
 
     Ok(Duration::from_millis(milliseconds))
 }
 
-fn map_upload_error(error: &MineSkinClientError) -> ApiError {
+fn map_upload_error(error: MineSkinClientError) -> ApiError {
     let status = if error.is_configuration_error() {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
-        match error {
+        match &error {
             MineSkinClientError::Configuration(_) => StatusCode::INTERNAL_SERVER_ERROR,
             MineSkinClientError::InvalidUpload(_) => StatusCode::BAD_REQUEST,
             MineSkinClientError::Upstream { status, .. } => match *status {
@@ -415,10 +422,10 @@ fn map_upload_error(error: &MineSkinClientError) -> ApiError {
         }
     };
 
-    mineskin_error(error, status, "MineSkin upload failed")
+    mineskin_error(error, status)
 }
 
-fn map_job_error(error: &MineSkinClientError) -> ApiError {
+fn map_job_error(error: MineSkinClientError) -> ApiError {
     let status = if error.is_configuration_error() {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
@@ -428,10 +435,10 @@ fn map_job_error(error: &MineSkinClientError) -> ApiError {
         }
     };
 
-    mineskin_error(error, status, "Failed to fetch MineSkin job")
+    mineskin_error(error, status)
 }
 
-fn map_proxy_error(error: &MineSkinClientError) -> ApiError {
+fn map_proxy_error(error: MineSkinClientError) -> ApiError {
     let status = if error.is_configuration_error() {
         StatusCode::INTERNAL_SERVER_ERROR
     } else if error.upstream_status() == Some(StatusCode::TOO_MANY_REQUESTS) {
@@ -440,20 +447,14 @@ fn map_proxy_error(error: &MineSkinClientError) -> ApiError {
         StatusCode::BAD_GATEWAY
     };
 
-    mineskin_error(error, status, "MineSkin proxy request failed")
+    mineskin_error(error, status)
 }
 
-/// Logs server-side failures at error level and client-caused outcomes at debug
-/// level. Transport errors get a generic message because reqwest includes the
-/// upstream URL in its error text.
-fn mineskin_error(error: &MineSkinClientError, status: StatusCode, context: &str) -> ApiError {
-    if status.is_server_error() {
-        error!(%error, %status, "{context}");
-    } else {
-        debug!(%error, %status, "{context}");
-    }
-
-    let message = match error {
+/// Builds the client response. `ApiError` logs it once, with the `MineSkin` error
+/// as its source. Transport errors get a generic message because reqwest
+/// includes the upstream URL in its error text.
+fn mineskin_error(error: MineSkinClientError, status: StatusCode) -> ApiError {
+    let message = match &error {
         MineSkinClientError::Request(_) => "MineSkin request failed".to_owned(),
         MineSkinClientError::Configuration(_)
         | MineSkinClientError::UnexpectedResponse { .. }
@@ -462,5 +463,5 @@ fn mineskin_error(error: &MineSkinClientError, status: StatusCode, context: &str
         | MineSkinClientError::InvalidUpload(_) => error.to_string(),
     };
 
-    ApiError::new(status, message)
+    ApiError::new(status, message).with_source(error)
 }

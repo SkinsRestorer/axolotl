@@ -381,7 +381,8 @@ async fn reports_cape_support_only_for_accounts_with_a_cape_grant() -> TestResul
                     "supported": true
                 }]
             })))
-            .expect(1)
+            // Capes are only fetched when the account can use them.
+            .expect(u64::from(has_cape_grant))
             .mount(&server)
             .await;
         let app = test_app(&format!("{}/v2/", server.uri()))?;
@@ -1088,6 +1089,59 @@ async fn redirects_the_root_straight_to_the_swagger_ui() -> TestResult {
     assert_eq!(
         response.headers().get(header::LOCATION),
         Some(&header::HeaderValue::from_static("/swagger/"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn caches_the_cape_grant_between_cape_support_requests() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "grants": { "capes": false }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    for _ in 0..2 {
+        let response = send(
+            &app,
+            Request::get("/mineskin/cape-support").body(Body::empty())?,
+        )
+        .await?;
+        assert_eq!(
+            json_body(response).await?,
+            json!({ "hasCapeGrant": false, "capes": [] })
+        );
+    }
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_non_numeric_wait_ms_with_the_range_message() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+    let boundary = "axolotl-wait-ms";
+
+    let response = send(
+        &app,
+        Request::post("/mineskin/skins?waitMs=soon")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_upload(boundary)))?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "waitMs must be an integer between 250 and 10000" })
     );
     Ok(())
 }
