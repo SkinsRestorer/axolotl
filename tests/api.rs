@@ -25,6 +25,9 @@ use wiremock::{
 };
 
 const LEGACY_ENCRYPTED_URL: &str = "skinsrestorer-axolotl://AAECAwQFBgcICQoLDA0OD8imM586fmS6OpsiL50KsnvRWjSo4S7vTKK3sl3b3l7RG1vToG52Tih6IdrpltHyHA==";
+/// A legacy CBC URL whose random IV encodes to base64 starting with "v2/",
+/// the prefix of the current format.
+const LEGACY_ENCRYPTED_URL_WITH_V2_PREFIX: &str = "skinsrestorer-axolotl://v2/ADQ4PEBESExQVFhcYGc7ZapKMUREWbvOc5sAljDbSTHfQgEPNTM/PSXVx9bdZNJB2gFJJtjle7cjIGhHEKg==";
 const SKIN_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
 /// `SKIN_UUID` in `MineSkin`'s format, which decrypted URLs use.
 const SKIN_ID: &str = "123e4567e89b12d3a456426614174000";
@@ -49,20 +52,23 @@ async fn serves_health_and_json_not_found_responses() -> TestResult {
 #[tokio::test]
 async fn decrypts_urls_created_by_the_legacy_service() -> TestResult {
     let app = test_app("http://127.0.0.1:9/v2/")?;
-    let query = form_urlencoded::Serializer::new(String::new())
-        .append_pair("encryptedUrl", LEGACY_ENCRYPTED_URL)
-        .finish();
-    let response = send(
-        &app,
-        Request::get(format!("/mineskin/decrypt-url?{query}")).body(Body::empty())?,
-    )
-    .await?;
+    for encrypted_url in [LEGACY_ENCRYPTED_URL, LEGACY_ENCRYPTED_URL_WITH_V2_PREFIX] {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("encryptedUrl", encrypted_url)
+            .finish();
+        let response = send(
+            &app,
+            Request::get(format!("/mineskin/decrypt-url?{query}")).body(Body::empty())?,
+        )
+        .await?;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        json_body(response).await?,
-        json!({ "url": format!("https://minesk.in/{SKIN_ID}") })
-    );
+        assert_eq!(response.status(), StatusCode::OK, "{encrypted_url}");
+        assert_eq!(
+            json_body(response).await?,
+            json!({ "url": format!("https://minesk.in/{SKIN_ID}") }),
+            "{encrypted_url}"
+        );
+    }
     Ok(())
 }
 
@@ -449,6 +455,43 @@ async fn reports_cape_support_upstream_failures_as_json() -> TestResult {
 }
 
 #[tokio::test]
+async fn repeats_a_rate_limited_cape_grant_lookup_without_asking_mineskin_again() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/me"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "success": false,
+            "errors": [{ "message": "rate limit exceeded" }]
+        })))
+        // The failure is cached for 5 seconds, so the second request reuses it.
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    for attempt in 0..2 {
+        let response = send(
+            &app,
+            Request::get("/mineskin/cape-support").body(Body::empty())?,
+        )
+        .await?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            json_body(response).await?,
+            json!({ "error": "rate limit exceeded" }),
+            "attempt {attempt}"
+        );
+    }
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn fails_cape_support_when_a_granted_account_cannot_list_capes() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -495,7 +538,11 @@ async fn rejects_invalid_decrypt_url_requests_with_json_errors() -> TestResult {
             .finish()
     };
     for (query, expected_error) in [
-        (String::new(), "encryptedUrl is required"),
+        (String::new(), "encryptedUrl must be provided exactly once"),
+        (
+            "encryptedUrl=a&encryptedUrl=b".to_owned(),
+            "encryptedUrl must be provided exactly once",
+        ),
         (
             encoded("https://minesk.in/123e4567-e89b-12d3-a456-426614174000"),
             "Invalid encrypted URL format",
@@ -817,12 +864,71 @@ async fn keeps_polling_an_upload_through_transient_job_status_errors() -> TestRe
 
     assert_eq!(response.status(), StatusCode::OK);
     let response = json_body(response).await?;
+    let encrypted_url = response
+        .pointer("/skin/url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("skinsrestorer-axolotl://v2/"))
+        .ok_or_else(|| io::Error::other(format!("unexpected upload response: {response}")))?;
+    assert_eq!(
+        response,
+        json!({
+            "success": true,
+            "skin": { "url": encrypted_url },
+            "warnings": [],
+            "messages": []
+        })
+    );
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("encryptedUrl", encrypted_url)
+        .finish();
+    let decrypted = send(
+        &app,
+        Request::get(format!("/mineskin/decrypt-url?{query}")).body(Body::empty())?,
+    )
+    .await?;
+    assert_eq!(
+        json_body(decrypted).await?,
+        json!({ "url": format!("https://minesk.in/{SKIN_ID}") })
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn backs_off_while_job_status_polls_keep_failing() -> TestResult {
+    let server = MockServer::start().await;
+    mount_supported_capes(&server, 1).await;
+    mount_enqueued_job(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-1"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "success": false,
+            "errors": [{ "message": "try again later" }]
+        })))
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    // The test config polls every millisecond and gives up after one second.
+    // Doubling the delay from 1 ms allows at most 10 polls in that second;
+    // a fixed 1 ms interval would poll hundreds of times.
+    let response = timeout(Duration::from_secs(5), post_upload(&app, "/mineskin/skins")).await??;
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "Timed out waiting for MineSkin job to finish" })
+    );
+    let polls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path() == "/v2/queue/job-1")
+        .count();
     assert!(
-        response
-            .pointer("/skin/url")
-            .and_then(Value::as_str)
-            .is_some_and(|url| url.starts_with("skinsrestorer-axolotl://v2/")),
-        "unexpected upload response: {response}"
+        (3..=12).contains(&polls),
+        "expected a backed-off number of polls, got {polls}"
     );
     server.verify().await;
     Ok(())
@@ -1398,6 +1504,7 @@ async fn caches_the_cape_grant_between_cape_support_requests() -> TestResult {
             Request::get("/mineskin/cape-support").body(Body::empty())?,
         )
         .await?;
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             json_body(response).await?,
             json!({ "hasCapeGrant": false, "capes": [] })
@@ -1490,5 +1597,226 @@ async fn rejects_skin_names_that_mineskin_would_reject() -> TestResult {
             "name {name:?}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_an_unsuccessful_job_status_response_without_retrying() -> TestResult {
+    let server = MockServer::start().await;
+    mount_supported_capes(&server, 1).await;
+    mount_enqueued_job(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": false,
+            "errors": [{ "code": "invalid_job", "message": "Job is invalid" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = post_upload(&app, "/mineskin/skins?waitMs=250").await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "Job is invalid" })
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn uploads_a_skin_file_sent_without_a_file_name() -> TestResult {
+    let server = MockServer::start().await;
+    mount_supported_capes(&server, 1).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/queue"))
+        .and(body_string_contains("filename=\"skin.png\""))
+        .and(body_string_contains("png-bytes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "job": { "id": "job-1", "status": "waiting", "result": null }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completed_job_response()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+    let boundary = "axolotl-no-file-name";
+    let body = multipart_upload(boundary).replace("; filename=\"skin.png\"", "");
+
+    let response = send(
+        &app,
+        Request::post("/mineskin/skins?waitMs=250")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_a_400_from_a_job_status_poll_as_a_gateway_error() -> TestResult {
+    let server = MockServer::start().await;
+    mount_supported_capes(&server, 1).await;
+    mount_enqueued_job(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-1"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "success": false,
+            "errors": [{ "code": "invalid_job_id", "message": "Invalid job ID" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = post_upload(&app, "/mineskin/skins?waitMs=250").await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "Invalid job ID" })
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn returns_json_for_unknown_swagger_files() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+
+    let index = send(&app, Request::get("/swagger/").body(Body::empty())?).await?;
+    assert_eq!(index.status(), StatusCode::OK);
+
+    let missing = send(&app, Request::get("/swagger/nope").body(Body::empty())?).await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(missing).await?, json!({ "error": "Not Found" }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_a_failed_job_on_the_job_status_route() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-failed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "job": { "id": "job-failed", "status": "failed", "result": null },
+            "errors": [{ "code": "invalid_image", "message": "Invalid skin image" }]
+        })))
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = send(
+        &app,
+        Request::get("/mineskin/jobs/job-failed").body(Body::empty())?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "Invalid skin image" })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_a_cape_response_without_a_cape_list() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/capes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "success": true })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    // Both requests fail: the broken response is not cached as an empty list,
+    // which would reject every upload's cape for five minutes.
+    for _ in 0..2 {
+        let response = send(&app, Request::get("/mineskin/capes").body(Body::empty())?).await?;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            json_body(response).await?,
+            json!({ "error": "Unexpected MineSkin cape response: capes is missing" })
+        );
+    }
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_an_empty_skin_file_before_calling_mineskin() -> TestResult {
+    let server = MockServer::start().await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+    let boundary = "axolotl-empty-file";
+    let body = multipart_upload(boundary).replace("png-bytes", "");
+
+    let response = send(
+        &app,
+        Request::post("/mineskin/skins?waitMs=250")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "A skin file must be provided" })
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "an empty file must not reach MineSkin"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn keeps_polling_after_an_unreadable_job_status_response() -> TestResult {
+    let server = MockServer::start().await;
+    mount_supported_capes(&server, 1).await;
+    mount_enqueued_job(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"success\": tr"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completed_job_response()))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = post_upload(&app, "/mineskin/skins?waitMs=250").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
