@@ -13,10 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use tokio::{sync::Semaphore, time::timeout};
-use tower_http::{
-    cors::{Any, CorsLayer},
-    trace::TraceLayer,
-};
+use tower_http::cors::{Any, CorsLayer};
 use utoipa::{
     OpenApi,
     openapi::{OpenApi as OpenApiDocument, Server},
@@ -103,7 +100,10 @@ pub fn build_app(
         .route("/mineskin/capes", get(supported_capes))
         .route("/mineskin/cape-support", get(cape_support))
         .route("/mineskin/decrypt-url", get(decrypt_url))
-        .merge(SwaggerUi::new("/swagger").url("/openapi", openapi))
+        .merge(
+            Router::from(SwaggerUi::new("/swagger").url("/openapi", openapi))
+                .layer(middleware::map_response(swagger_not_found)),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -114,9 +114,6 @@ pub fn build_app(
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                 .allow_headers(Any),
         )
-        // ApiError logs failed responses with their cause, so skip TraceLayer's
-        // second error line for each 5xx.
-        .layer(TraceLayer::new_for_http().on_failure(()))
         .layer(middleware::from_fn_with_state(metrics, record_metrics));
 
     Ok(api)
@@ -127,7 +124,7 @@ async fn record_metrics(
     request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path().to_owned();
+    let path = metrics_path(request.method(), request.uri().path()).to_owned();
     let client_ip = client_ip(&request);
     let started_at = Instant::now();
     let response = next.run(request).await;
@@ -138,6 +135,20 @@ async fn record_metrics(
         started_at.elapsed(),
     );
     response
+}
+
+/// Returns the path to record for a request.
+///
+/// Requests with a method that an endpoint does not serve, such as CORS
+/// preflights and 405 responses, must not count as uploads or decryptions.
+/// They are recorded under a path that no endpoint uses.
+fn metrics_path<'a>(method: &Method, path: &'a str) -> &'a str {
+    let served = match path {
+        "/mineskin/skins" => method == Method::POST,
+        "/mineskin/decrypt-url" => method == Method::GET || method == Method::HEAD,
+        _ => true,
+    };
+    if served { path } else { "" }
 }
 
 fn client_ip(request: &Request) -> Option<IpAddr> {
@@ -215,21 +226,72 @@ async fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "Not Found")
 }
 
+/// Replaces the empty 404 that Swagger UI returns for unknown files with the
+/// JSON error that every other route returns.
+async fn swagger_not_found(response: Response) -> Response {
+    if response.status() == StatusCode::NOT_FOUND {
+        not_found().await.into_response()
+    } else {
+        response
+    }
+}
+
 async fn method_not_allowed() -> ApiError {
     ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
+    };
 
     use axum::{
         body::Body,
         extract::ConnectInfo,
-        http::{Request, header::HeaderValue},
+        http::{Request, StatusCode, header, header::HeaderValue},
     };
+    use tower::ServiceExt;
+    use url::Url;
 
-    use super::client_ip;
+    use super::{build_app, client_ip};
+    use crate::{config::AppConfig, metrics::Metrics};
+
+    #[tokio::test]
+    async fn does_not_count_preflights_or_wrong_methods_as_endpoint_requests() {
+        let metrics = Arc::new(Metrics::default());
+        let config = AppConfig::for_tests(Url::parse("http://127.0.0.1:9/v2/").expect("valid URL"));
+        let app = build_app(&config, Arc::clone(&metrics)).expect("app should build");
+
+        let preflight = Request::options("/mineskin/skins")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .expect("valid request");
+        let wrong_method = Request::get("/mineskin/skins")
+            .body(Body::empty())
+            .expect("valid request");
+        let decrypt_preflight = Request::options("/mineskin/decrypt-url")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .expect("valid request");
+        for (request, status) in [
+            (preflight, StatusCode::OK),
+            (wrong_method, StatusCode::METHOD_NOT_ALLOWED),
+            (decrypt_preflight, StatusCode::OK),
+        ] {
+            let response = app.clone().oneshot(request).await.expect("infallible");
+            assert_eq!(response.status(), status);
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.requests, 3);
+        assert_eq!(snapshot.upload.requests, 0);
+        assert_eq!(snapshot.decrypt.requests, 0);
+        assert_eq!(snapshot.other_requests, 3);
+    }
 
     #[test]
     fn prefers_cloudflare_client_ip_and_normalizes_mapped_ipv4() {
