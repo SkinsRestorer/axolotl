@@ -6,7 +6,6 @@ use std::{
 };
 
 use axum::body::Bytes;
-use futures_util::StreamExt;
 use reqwest::{
     Client, RequestBuilder, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
@@ -82,10 +81,14 @@ impl MineSkinClient {
         self.default_poll_interval
     }
 
+    /// Fetches a job for the job status route. A failed job is an error, so it
+    /// does not look like a pending one.
     pub async fn fetch_job(&self, job_id: &str) -> Result<JobSuccessResponse, MineSkinClientError> {
-        self.fetch_job_with_errors(job_id)
-            .await
-            .map(|(response, _)| response)
+        let (response, errors) = self.fetch_job_with_errors(job_id).await?;
+        if response.job.status == JobStatus::Failed {
+            return Err(failed_job_error(errors));
+        }
+        Ok(response)
     }
 
     /// Fetches a job and keeps the upstream `errors` list, which `MineSkin`
@@ -152,17 +155,7 @@ impl MineSkinClient {
                         }
                         return self.sanitize_job(response);
                     }
-                    JobStatus::Failed => {
-                        let message = errors
-                            .into_iter()
-                            .flatten()
-                            .find_map(|item| item.message)
-                            .unwrap_or_else(|| "MineSkin job failed to complete".to_owned());
-                        return Err(MineSkinClientError::upstream(
-                            StatusCode::BAD_GATEWAY,
-                            message,
-                        ));
-                    }
+                    JobStatus::Failed => return Err(failed_job_error(errors)),
                     JobStatus::Unknown => {
                         if !warned_unknown_status {
                             warn!(
@@ -379,7 +372,9 @@ impl MineSkinClient {
 
         response
             .capes
-            .unwrap_or_default()
+            .ok_or_else(|| {
+                MineSkinClientError::unexpected("MineSkin cape response", "capes is missing")
+            })?
             .into_iter()
             .filter(|cape| cape.supported == Some(true))
             .map(|cape| {
@@ -448,9 +443,12 @@ impl MineSkinClient {
             let response = request.send().await.map_err(MineSkinClientError::Request)?;
             let status = response.status();
             let mut body = Vec::new();
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(MineSkinClientError::Request)?;
+            let mut response = response;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(MineSkinClientError::Request)?
+            {
                 if body
                     .len()
                     .checked_add(chunk.len())
@@ -471,8 +469,11 @@ impl MineSkinClient {
             }
             let response = parse_response(context, &buffered)?;
             if response.success == Some(false) {
+                // Keep the 2xx status: MineSkin answered and rejected the
+                // request, so the job poll must not retry it as a 5xx. The
+                // routes still return 502 for it.
                 return Err(MineSkinClientError::upstream(
-                    StatusCode::BAD_GATEWAY,
+                    status,
                     response.into_error_message(),
                 ));
             }
@@ -630,6 +631,16 @@ fn parse_error_response(context: &'static str, response: &BufferedResponse) -> M
     }
 }
 
+/// Builds the error for a failed job from `MineSkin`'s first error message.
+fn failed_job_error(errors: Option<Vec<MineSkinErrorItem>>) -> MineSkinClientError {
+    let message = errors
+        .into_iter()
+        .flatten()
+        .find_map(|item| item.message)
+        .unwrap_or_else(|| "MineSkin job failed to complete".to_owned());
+    MineSkinClientError::upstream(StatusCode::BAD_GATEWAY, message)
+}
+
 fn normalize_texture_url(value: &str) -> Result<String, MineSkinClientError> {
     let mut url = Url::parse(value).map_err(|error| {
         tracing::debug!(%error, "Invalid MineSkin cape URL");
@@ -713,17 +724,16 @@ impl MineSkinClientError {
     }
 
     /// Returns whether a job status request may succeed when retried:
-    /// request failures, timeouts, rate limits, and upstream server errors.
+    /// request failures, timeouts, rate limits, upstream server errors, and
+    /// responses the proxy could not read, such as a truncated body or an HTML
+    /// page from a proxy in front of `MineSkin`.
     fn is_transient(&self) -> bool {
         match self {
-            Self::Request(_) => true,
+            Self::Request(_) | Self::UnexpectedResponse { .. } => true,
             Self::Upstream { status, .. } => {
                 *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
-            Self::Configuration(_)
-            | Self::UnexpectedResponse { .. }
-            | Self::Crypto(_)
-            | Self::InvalidUpload(_) => false,
+            Self::Configuration(_) | Self::Crypto(_) | Self::InvalidUpload(_) => false,
         }
     }
 
@@ -1000,6 +1010,32 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stops_polling_when_mineskin_reports_an_unsuccessful_response() -> TestResult {
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "success": false,
+                "errors": [{ "code": "invalid_job", "message": "Job is invalid" }]
+            })),
+        )
+        .await;
+        let client = poll_test_client(&server, Duration::from_secs(1))?;
+
+        let error = client
+            .poll_job("job-poll", Duration::ZERO)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+
+        assert!(!error.is_transient());
+        assert_eq!(error.to_string(), "Job is invalid");
+        server.verify().await;
         Ok(())
     }
 
