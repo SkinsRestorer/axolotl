@@ -40,7 +40,7 @@ impl DiscordReporter {
             };
         };
 
-        let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
         let initial_snapshot = metrics.snapshot();
         let reporter_started_at = Instant::now();
         let task = tokio::spawn(async move {
@@ -54,36 +54,16 @@ impl DiscordReporter {
                     return;
                 }
             };
-            let mut ticker = interval(REPORT_INTERVAL);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            ticker.tick().await;
-            let mut last_successful_snapshot = initial_snapshot;
-            let mut last_successful_report_at = reporter_started_at;
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut shutdown_receiver => break,
-                    _ = ticker.tick() => {
-                        let now = Instant::now();
-                        let current_snapshot = metrics.snapshot();
-                        let report = current_snapshot.since(
-                            &last_successful_snapshot,
-                            now.saturating_duration_since(last_successful_report_at),
-                        );
-                        match send_report(&client, &webhook, &report).await {
-                            Ok(()) => {
-                                metrics.acknowledge_client_requests(&current_snapshot);
-                                last_successful_snapshot = current_snapshot;
-                                last_successful_report_at = now;
-                            }
-                            Err(error) => {
-                                error!(%error, "Failed to send Discord status report");
-                            }
-                        }
-                    },
-                }
-            }
+            run(
+                &client,
+                &webhook,
+                &metrics,
+                shutdown_receiver,
+                initial_snapshot,
+                reporter_started_at,
+                REPORT_INTERVAL,
+            )
+            .await;
         });
         info!("Discord status reporter started");
         Self {
@@ -104,6 +84,52 @@ impl DiscordReporter {
             && let Err(error) = task.await
         {
             error!(%error, "Discord status reporter stopped unexpectedly");
+        }
+    }
+}
+
+async fn run(
+    client: &reqwest::Client,
+    webhook: &Url,
+    metrics: &Metrics,
+    mut shutdown_receiver: oneshot::Receiver<()>,
+    initial_snapshot: MetricsSnapshot,
+    reporter_started_at: Instant,
+    report_interval: Duration,
+) {
+    let mut ticker = interval(report_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await;
+    let mut last_successful_snapshot = initial_snapshot;
+    let mut last_successful_report_at = reporter_started_at;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown_receiver => break,
+            _ = ticker.tick() => {}
+        }
+        let now = Instant::now();
+        let current_snapshot = metrics.snapshot();
+        let report = current_snapshot.since(
+            &last_successful_snapshot,
+            now.saturating_duration_since(last_successful_report_at),
+        );
+        // A slow webhook must not hold up shutdown until the request times out.
+        let result = tokio::select! {
+            biased;
+            _ = &mut shutdown_receiver => break,
+            result = send_report(client, webhook, &report) => result,
+        };
+        match result {
+            Ok(()) => {
+                metrics.acknowledge_client_requests(&current_snapshot);
+                last_successful_snapshot = current_snapshot;
+                last_successful_report_at = now;
+            }
+            Err(error) => {
+                error!(%error, "Failed to send Discord status report");
+            }
         }
     }
 }
@@ -171,7 +197,9 @@ fn build_report(snapshot: &MetricsSnapshot, server: &str) -> serde_json::Value {
                     "inline": false
                 }
             ],
-            "timestamp": jiff::Timestamp::now().to_string(),
+            // Discord documents only "ISO8601", so send millisecond precision like
+            // JavaScript's `toISOString` instead of jiff's default nanoseconds.
+            "timestamp": format!("{:.3}", jiff::Timestamp::now()),
             "footer": { "text": format!("Axolotl v{}", env!("CARGO_PKG_VERSION")) }
         }]
     })
@@ -455,12 +483,19 @@ async fn load_average() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, net::IpAddr, str::FromStr, time::Duration};
+    use std::{
+        collections::HashMap,
+        net::IpAddr,
+        str::FromStr,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
+    use tokio::{sync::oneshot, time::timeout};
     use url::Url;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-    use super::{ClientInsight, MetricsSnapshot, send_report};
+    use super::{ClientInsight, Metrics, MetricsSnapshot, build_report, run, send_report};
 
     #[test]
     fn identifies_distributed_and_dominant_client_traffic() {
@@ -526,5 +561,72 @@ mod tests {
             !error.to_string().contains("secret-token"),
             "error should not include the webhook token: {error}"
         );
+    }
+
+    #[test]
+    fn sends_the_embed_timestamp_with_millisecond_precision() {
+        let report = build_report(&MetricsSnapshot::default(), "server");
+        let timestamp = report
+            .pointer("/embeds/0/timestamp")
+            .and_then(serde_json::Value::as_str)
+            .expect("the embed should have a timestamp");
+
+        let (_, fraction) = timestamp
+            .strip_suffix('Z')
+            .and_then(|timestamp| timestamp.rsplit_once('.'))
+            .expect("the timestamp should be UTC with a fractional second");
+        assert_eq!(fraction.len(), 3, "unexpected timestamp: {timestamp}");
+        timestamp
+            .parse::<jiff::Timestamp>()
+            .expect("the timestamp should be valid ISO 8601");
+    }
+
+    #[tokio::test]
+    async fn stops_while_a_report_is_in_flight() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_mins(1)))
+            .mount(&server)
+            .await;
+        let webhook = Url::parse(&format!("{}/api/webhooks/1/token", server.uri()))
+            .expect("test webhook URL should be valid");
+        let client = crate::http_client::builder(Duration::from_mins(2))
+            .build()
+            .expect("test HTTP client should build");
+        let metrics = Arc::new(Metrics::default());
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            async move {
+                run(
+                    &client,
+                    &webhook,
+                    &metrics,
+                    shutdown_receiver,
+                    metrics.snapshot(),
+                    Instant::now(),
+                    Duration::from_millis(10),
+                )
+                .await;
+            }
+        });
+
+        timeout(Duration::from_secs(10), async {
+            while server
+                .received_requests()
+                .await
+                .is_none_or(|requests| requests.is_empty())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reporter should send a report");
+        shutdown.send(()).expect("the reporter should be running");
+
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown should not wait for the webhook response")
+            .expect("the reporter task should not panic");
     }
 }
