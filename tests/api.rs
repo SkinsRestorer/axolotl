@@ -26,6 +26,8 @@ use wiremock::{
 
 const LEGACY_ENCRYPTED_URL: &str = "skinsrestorer-axolotl://AAECAwQFBgcICQoLDA0OD8imM586fmS6OpsiL50KsnvRWjSo4S7vTKK3sl3b3l7RG1vToG52Tih6IdrpltHyHA==";
 const SKIN_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+/// `SKIN_UUID` in `MineSkin`'s format, which decrypted URLs use.
+const SKIN_ID: &str = "123e4567e89b12d3a456426614174000";
 const CAPE_UUID: &str = "123e4567-e89b-12d3-a456-426614174001";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -59,7 +61,7 @@ async fn decrypts_urls_created_by_the_legacy_service() -> TestResult {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         json_body(response).await?,
-        json!({ "url": format!("https://minesk.in/{SKIN_UUID}") })
+        json!({ "url": format!("https://minesk.in/{SKIN_ID}") })
     );
     Ok(())
 }
@@ -677,7 +679,7 @@ async fn verify_encrypted_upload(completed: Value) -> TestResult {
     assert_eq!(decrypted.status(), StatusCode::OK, "decryption failed");
     assert_eq!(
         json_body(decrypted).await?,
-        json!({ "url": format!("https://minesk.in/{SKIN_UUID}") }),
+        json!({ "url": format!("https://minesk.in/{SKIN_ID}") }),
         "decrypted URL did not match the uploaded skin"
     );
 

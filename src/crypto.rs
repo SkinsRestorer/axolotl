@@ -191,42 +191,15 @@ impl UrlCipher {
     #[cfg(test)]
     fn encrypt_uuid_with_iv(&self, uuid: &str, iv: [u8; 16]) -> Result<String, CryptoError> {
         let key = self.key()?;
-        let plaintext = uuid.as_bytes();
-        let buffer_length = plaintext
-            .len()
-            .checked_add(16)
-            .ok_or(CryptoError::Encryption)?;
-        let mut buffer = Vec::new();
-        buffer.try_reserve_exact(buffer_length).map_err(|error| {
-            tracing::debug!(%error, "Failed to encrypt MineSkin URL");
-            CryptoError::Encryption
-        })?;
-        buffer.extend_from_slice(plaintext);
-        buffer.resize(buffer_length, 0);
-
+        // Room for the plaintext plus one block of PKCS#7 padding.
+        let mut buffer = uuid.as_bytes().to_vec();
+        buffer.extend_from_slice(&[0; 16]);
         let ciphertext = Aes256CbcEncryptor::new(key.into(), (&iv).into())
-            .encrypt_padded::<Pkcs7>(&mut buffer, plaintext.len())
-            .map_err(|error| {
-                tracing::debug!(%error, "Failed to encrypt MineSkin URL");
-                CryptoError::Encryption
-            })?;
-        let combined_length = iv
-            .len()
-            .checked_add(ciphertext.len())
-            .ok_or(CryptoError::Encryption)?;
-        let mut combined = Vec::new();
-        combined
-            .try_reserve_exact(combined_length)
-            .map_err(|error| {
-                tracing::debug!(%error, "Failed to encrypt MineSkin URL");
-                CryptoError::Encryption
-            })?;
-        combined.extend_from_slice(&iv);
-        combined.extend_from_slice(ciphertext);
-
+            .encrypt_padded::<Pkcs7>(&mut buffer, uuid.len())
+            .expect("the buffer has room for one padding block");
         Ok(format!(
             "{ENCRYPTED_URL_SCHEME}{}",
-            STANDARD.encode(combined)
+            STANDARD.encode([iv.as_slice(), ciphertext].concat())
         ))
     }
 
@@ -253,8 +226,11 @@ pub enum CryptoError {
     Randomness,
 }
 
+/// Formats a skin UUID the way `MineSkin` does: 32 hex digits without hyphens.
+/// `MineSkin` rewrites `minesk.in/<id>` links with `[0-9a-zA-Z]+`, so a hyphen
+/// would cut the ID short.
 fn canonical_uuid(value: &str) -> Result<String, uuid::Error> {
-    Uuid::parse_str(value).map(|uuid| uuid.hyphenated().to_string())
+    Uuid::parse_str(value).map(|uuid| uuid.simple().to_string())
 }
 
 #[cfg(test)]
@@ -266,6 +242,8 @@ mod tests {
     use super::*;
 
     const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    /// The same UUID in `MineSkin`'s format, which decrypted URLs use.
+    const SKIN_ID: &str = "123e4567e89b12d3a456426614174000";
     const LEGACY_PAYLOAD: &str =
         "AAECAwQFBgcICQoLDA0OD8imM586fmS6OpsiL50KsnvRWjSo4S7vTKK3sl3b3l7RG1vToG52Tih6IdrpltHyHA==";
 
@@ -289,7 +267,7 @@ mod tests {
 
         let decrypted = cipher.decrypt_url(&format!("{ENCRYPTED_URL_SCHEME}{LEGACY_PAYLOAD}"))?;
 
-        assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{UUID}"));
+        assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{SKIN_ID}"));
         Ok(())
     }
 
@@ -304,7 +282,7 @@ mod tests {
         )));
         assert_eq!(
             cipher.decrypt_url(&encrypted)?,
-            format!("{MINESKIN_URL_PREFIX}{UUID}")
+            format!("{MINESKIN_URL_PREFIX}{SKIN_ID}")
         );
 
         let payload = encrypted
@@ -394,7 +372,7 @@ mod tests {
 
         let decrypted = cipher.decrypt_url(&encrypted.replace('+', " "))?;
 
-        assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{UUID}"));
+        assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{SKIN_ID}"));
         Ok(())
     }
 
@@ -460,9 +438,9 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_non_canonical_uuids() -> Result<(), CryptoError> {
+    fn decrypts_every_uuid_form_to_the_mineskin_id() -> Result<(), CryptoError> {
         let cipher = UrlCipher::new(Some("test-secret"));
-        let expected = format!("{MINESKIN_URL_PREFIX}{UUID}");
+        let expected = format!("{MINESKIN_URL_PREFIX}{SKIN_ID}");
 
         for uuid in [
             "123e4567e89b12d3a456426614174000",
