@@ -5,13 +5,15 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     Json,
     extract::{
-        Multipart, Path, Query, State, multipart::MultipartRejection, rejection::QueryRejection,
+        Multipart, Path, Query, State,
+        multipart::{MultipartError, MultipartRejection},
+        rejection::{PathRejection, QueryRejection},
     },
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use tracing::error;
+use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -27,6 +29,9 @@ use crate::{
 const MINIMUM_POLL_INTERVAL_MS: u64 = 250;
 const MAXIMUM_POLL_INTERVAL_MS: u64 = 10_000;
 const MAXIMUM_FILE_SIZE: usize = 5 * 1024 * 1024;
+const MAXIMUM_JOB_ID_LENGTH: usize = 64;
+const INVALID_JOB_ID_MESSAGE: &str =
+    "jobId must contain 1 to 64 letters, digits, hyphens, or underscores";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,6 +97,7 @@ pub struct DecryptedUrlResponse {
         (status = 200, description = "MineSkin job completed successfully.", body = SanitizedResponse),
         (status = 400, description = "Invalid request payload.", body = ErrorResponse),
         (status = 408, description = "The upload body was not received in time.", body = ErrorResponse),
+        (status = 413, description = "The upload body exceeds the size limit.", body = ErrorResponse),
         (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse),
@@ -152,10 +158,16 @@ pub async fn upload_skin(
     tag = "mineskin",
     description = "Retrieve the status of a MineSkin job.",
     params(
-        ("jobId" = String, Path, description = "Identifier of the MineSkin job.")
+        (
+            "jobId" = String,
+            Path,
+            pattern = "^[A-Za-z0-9_-]{1,64}$",
+            description = "Identifier of the MineSkin job."
+        )
     ),
     responses(
         (status = 200, description = "Job retrieved successfully.", body = SanitizedResponse),
+        (status = 400, description = "Invalid job identifier.", body = ErrorResponse),
         (status = 404, description = "Job could not be found.", body = ErrorResponse),
         (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
@@ -164,8 +176,14 @@ pub async fn upload_skin(
 )]
 pub async fn job_status(
     State(state): State<Arc<AppState>>,
-    Path(path): Path<JobPath>,
+    path: Result<Path<JobPath>, PathRejection>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
+    let Path(path) =
+        path.map_err(|error| ApiError::bad_request(INVALID_JOB_ID_MESSAGE).with_source(error))?;
+    if !is_valid_job_id(&path.job_id) {
+        return Err(ApiError::bad_request(INVALID_JOB_ID_MESSAGE));
+    }
+
     let job = state
         .mineskin
         .fetch_job(&path.job_id)
@@ -274,9 +292,7 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
     let mut cape_uuid = None;
     let mut cape_alias = None;
 
-    while let Some(field) = multipart.next_field().await.map_err(|error| {
-        ApiError::bad_request("Failed to parse multipart form data").with_source(error)
-    })? {
+    while let Some(field) = multipart.next_field().await.map_err(map_multipart_error)? {
         let Some(field_name) = field.name().map(str::to_owned) else {
             continue;
         };
@@ -285,9 +301,7 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
             "file" if file.is_none() && field.file_name().is_some() => {
                 let file_name = field.file_name().map(str::to_owned);
                 let content_type = field.content_type().map(str::to_owned);
-                let bytes = field.bytes().await.map_err(|error| {
-                    ApiError::bad_request("Failed to parse multipart form data").with_source(error)
-                })?;
+                let bytes = field.bytes().await.map_err(map_multipart_error)?;
                 if bytes.len() > MAXIMUM_FILE_SIZE {
                     return Err(ApiError::bad_request("Skin file must not exceed 5 MiB"));
                 }
@@ -346,9 +360,28 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
 }
 
 async fn read_text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, ApiError> {
-    field.text().await.map_err(|error| {
-        ApiError::bad_request("Failed to parse multipart form data").with_source(error)
-    })
+    field.text().await.map_err(map_multipart_error)
+}
+
+fn map_multipart_error(error: MultipartError) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Skin upload body exceeds the size limit",
+        )
+        .with_source(error);
+    }
+
+    ApiError::bad_request("Failed to parse multipart form data").with_source(error)
+}
+
+/// `MineSkin` job IDs are opaque tokens. Accept only URL-safe characters so an ID
+/// such as `..` cannot change the upstream path after percent-decoding.
+fn is_valid_job_id(job_id: &str) -> bool {
+    (1..=MAXIMUM_JOB_ID_LENGTH).contains(&job_id.len())
+        && job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn validate_poll_interval(interval: Duration) -> Result<Duration, ApiError> {
@@ -363,57 +396,72 @@ fn validate_poll_interval(interval: Duration) -> Result<Duration, ApiError> {
 }
 
 fn map_upload_error(error: &MineSkinClientError) -> ApiError {
-    error!(%error, "MineSkin upload failed");
+    let status = if error.is_configuration_error() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        match error {
+            MineSkinClientError::Configuration(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            MineSkinClientError::InvalidUpload(_) => StatusCode::BAD_REQUEST,
+            MineSkinClientError::Upstream { status, .. } => match *status {
+                StatusCode::BAD_REQUEST
+                | StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::GATEWAY_TIMEOUT => *status,
+                _ => StatusCode::BAD_GATEWAY,
+            },
+            MineSkinClientError::Request(_)
+            | MineSkinClientError::UnexpectedResponse { .. }
+            | MineSkinClientError::Crypto(_) => StatusCode::BAD_GATEWAY,
+        }
+    };
 
-    if error.is_configuration_error() {
-        return ApiError::internal(error.to_string());
-    }
-
-    match error {
-        MineSkinClientError::Configuration(_) => ApiError::internal(error.to_string()),
-        MineSkinClientError::InvalidUpload(_) => ApiError::bad_request(error.to_string()),
-        MineSkinClientError::Upstream { status, .. } => match *status {
-            StatusCode::BAD_REQUEST => ApiError::bad_request(error.to_string()),
-            StatusCode::TOO_MANY_REQUESTS => {
-                ApiError::new(StatusCode::TOO_MANY_REQUESTS, error.to_string())
-            }
-            StatusCode::GATEWAY_TIMEOUT => {
-                ApiError::new(StatusCode::GATEWAY_TIMEOUT, error.to_string())
-            }
-            _ => ApiError::bad_gateway(error.to_string()),
-        },
-        MineSkinClientError::Request(_)
-        | MineSkinClientError::UnexpectedResponse { .. }
-        | MineSkinClientError::Crypto(_) => ApiError::bad_gateway(error.to_string()),
-    }
+    mineskin_error(error, status, "MineSkin upload failed")
 }
 
 fn map_job_error(error: &MineSkinClientError) -> ApiError {
-    error!(%error, "Failed to fetch MineSkin job");
+    let status = if error.is_configuration_error() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        match error.upstream_status() {
+            Some(status @ (StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS)) => status,
+            _ => StatusCode::BAD_GATEWAY,
+        }
+    };
 
-    if error.is_configuration_error() {
-        return ApiError::internal(error.to_string());
-    }
-    if error.upstream_status() == Some(StatusCode::NOT_FOUND) {
-        return ApiError::new(StatusCode::NOT_FOUND, error.to_string());
-    }
-    if error.upstream_status() == Some(StatusCode::TOO_MANY_REQUESTS) {
-        return ApiError::new(StatusCode::TOO_MANY_REQUESTS, error.to_string());
-    }
-
-    ApiError::bad_gateway(error.to_string())
+    mineskin_error(error, status, "Failed to fetch MineSkin job")
 }
 
 fn map_proxy_error(error: &MineSkinClientError) -> ApiError {
-    error!(%error, "MineSkin proxy request failed");
-
-    if error.is_configuration_error() {
-        ApiError::internal(error.to_string())
+    let status = if error.is_configuration_error() {
+        StatusCode::INTERNAL_SERVER_ERROR
     } else if error.upstream_status() == Some(StatusCode::TOO_MANY_REQUESTS) {
-        ApiError::new(StatusCode::TOO_MANY_REQUESTS, error.to_string())
+        StatusCode::TOO_MANY_REQUESTS
     } else {
-        ApiError::bad_gateway(error.to_string())
+        StatusCode::BAD_GATEWAY
+    };
+
+    mineskin_error(error, status, "MineSkin proxy request failed")
+}
+
+/// Logs server-side failures at error level and client-caused outcomes at debug
+/// level. Transport errors get a generic message because reqwest includes the
+/// upstream URL in its error text.
+fn mineskin_error(error: &MineSkinClientError, status: StatusCode, context: &str) -> ApiError {
+    if status.is_server_error() {
+        error!(%error, %status, "{context}");
+    } else {
+        debug!(%error, %status, "{context}");
     }
+
+    let message = match error {
+        MineSkinClientError::Request(_) => "MineSkin request failed".to_owned(),
+        MineSkinClientError::Configuration(_)
+        | MineSkinClientError::UnexpectedResponse { .. }
+        | MineSkinClientError::Upstream { .. }
+        | MineSkinClientError::Crypto(_)
+        | MineSkinClientError::InvalidUpload(_) => error.to_string(),
+    };
+
+    ApiError::new(status, message)
 }
 
 trait OptionalStringExt {
