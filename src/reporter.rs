@@ -125,6 +125,11 @@ async fn run(
             Ok(()) => {
                 metrics.acknowledge_client_requests(&current_snapshot);
                 last_successful_snapshot = current_snapshot;
+                // The next report reads only the counters from this snapshot,
+                // so don't keep up to three more copies of the client tables.
+                last_successful_snapshot.client_requests = HashMap::new();
+                last_successful_snapshot.upload.client_requests = HashMap::new();
+                last_successful_snapshot.decrypt.client_requests = HashMap::new();
                 last_successful_report_at = now;
             }
             Err(error) => {
@@ -252,7 +257,7 @@ fn format_endpoint_stats(snapshot: &EndpointSnapshot) -> String {
         .client_errors
         .saturating_add(snapshot.server_errors);
     let error_percentage = percentage(errors, snapshot.requests);
-    let client_insight = ClientInsight::from_requests(&snapshot.client_requests);
+    let client_insight = ClientInsight::from_requests(&snapshot.client_requests, snapshot.requests);
     format!(
         "**Requests:** {}\n**Successful:** {}\n**4xx:** {}\n**5xx:** {}\n**Error rate:** {error_percentage:.1}%\n**Latency:** {} avg / {} p50 / {} p95\n**Pattern:** {}\n**Unique IPs:** {}\n**Attributed:** {} / {}\n**One-request IPs:** {} ({:.1}%)\n**Top IP:** {} req ({:.1}%)\n**Top 5 IPs:** {} req ({:.1}%)\n**Avg/IP:** {:.1}",
         format_number(snapshot.requests),
@@ -333,14 +338,14 @@ struct ClientInsight {
 
 impl ClientInsight {
     fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
-        Self::from_requests(&snapshot.client_requests)
+        Self::from_requests(&snapshot.client_requests, snapshot.requests)
     }
 
     #[expect(
         clippy::cast_precision_loss,
         reason = "the reported metric is rounded for display"
     )]
-    fn from_requests(requests: &HashMap<IpAddr, u64>) -> Self {
+    fn from_requests(requests: &HashMap<IpAddr, u64>, total_requests: u64) -> Self {
         let mut request_counts = requests.values().copied().collect::<Vec<_>>();
         request_counts.sort_unstable_by(|left, right| right.cmp(left));
 
@@ -360,6 +365,8 @@ impl ClientInsight {
             attributed_requests as f64 / unique_clients as f64
         };
         let pattern = match () {
+            // An idle window has no IPs to attribute, which is not missing data.
+            () if total_requests == 0 => "No traffic",
             () if attributed_requests == 0 => "No IP data",
             () if unique_clients == 1 => "Single client",
             () if top_client_percentage >= 60.0 => "One dominant client",
@@ -474,13 +481,17 @@ fn format_latency(duration: Duration) -> String {
     format!("{:.2} s", duration.as_secs_f64())
 }
 
-/// Percentiles come from histogram buckets, and the last bucket has no upper
-/// bound, so anything above its 60 s lower bound only means "more than 60 s".
+/// Percentiles come from histogram buckets and report the bucket's upper
+/// bound, so a value only means "at most this long". The last bucket has no
+/// upper bound, so anything above its 60 s lower bound means "more than 60 s".
 fn format_percentile_latency(duration: Duration) -> String {
+    if duration.is_zero() {
+        return format_latency(duration);
+    }
     if duration > Duration::from_mins(1) {
         return ">60 s".to_owned();
     }
-    format_latency(duration)
+    format!("≤{}", format_latency(duration))
 }
 
 async fn process_rss_bytes() -> Option<u64> {
@@ -527,11 +538,53 @@ mod tests {
         let percentile = metrics.snapshot().mineskin_latency.percentile(95);
 
         assert_eq!(format_percentile_latency(percentile), ">60 s");
-        assert_eq!(format_percentile_latency(Duration::from_mins(1)), "60.00 s");
+        assert_eq!(
+            format_percentile_latency(Duration::from_mins(1)),
+            "≤60.00 s"
+        );
         assert_eq!(
             format_percentile_latency(Duration::from_millis(250)),
-            "250 ms"
+            "≤250 ms"
         );
+    }
+
+    #[test]
+    fn shows_percentiles_as_bucket_upper_bounds() {
+        let metrics = Metrics::default();
+        metrics.finish_mineskin_request(Duration::from_micros(400), false, false);
+        let latency = metrics.snapshot().mineskin_latency;
+
+        // Every call took 0.4 ms, so the 5 ms bucket bound is not the p50 itself.
+        assert_eq!(format_latency(latency.average()), "<1 ms");
+        assert_eq!(format_percentile_latency(latency.percentile(50)), "≤5 ms");
+        assert_eq!(format_percentile_latency(Duration::ZERO), "N/A");
+    }
+
+    #[test]
+    fn labels_a_window_without_requests_as_no_traffic() {
+        let report = build_report(&MetricsSnapshot::default(), "server");
+        let fields = report
+            .pointer("/embeds/0/fields")
+            .and_then(serde_json::Value::as_array)
+            .expect("the embed should have fields");
+        for name in ["Uploads", "Decryptions", "Clients"] {
+            let value = fields
+                .iter()
+                .find(|field| {
+                    field["name"]
+                        .as_str()
+                        .is_some_and(|field_name| field_name.starts_with(name))
+                })
+                .and_then(|field| field["value"].as_str())
+                .expect("the field should exist");
+            assert!(
+                value.contains("**Pattern:** No traffic"),
+                "{name} should report no traffic: {value}"
+            );
+        }
+
+        let unattributed = ClientInsight::from_requests(&HashMap::new(), 3);
+        assert_eq!(unattributed.pattern, "No IP data");
     }
 
     #[test]
@@ -572,6 +625,7 @@ mod tests {
             })
             .collect::<HashMap<_, _>>();
         let distributed = ClientInsight::from_snapshot(&MetricsSnapshot {
+            requests: 20,
             client_requests: distributed_counts,
             ..MetricsSnapshot::default()
         });
@@ -581,6 +635,7 @@ mod tests {
         assert!((distributed.top_client_percentage - 5.0).abs() < f64::EPSILON);
 
         let dominant = ClientInsight::from_snapshot(&MetricsSnapshot {
+            requests: 100,
             client_requests: HashMap::from([
                 (
                     IpAddr::from_str("192.0.2.1").expect("test IP should be valid"),
