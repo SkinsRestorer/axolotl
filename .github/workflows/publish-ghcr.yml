@@ -1,42 +1,66 @@
 name: Publish GHCR Image
 
+# Publish only after the "Build and test" workflow (build.yml) passes for a
+# push to main. A workflow_run trigger avoids duplicating the test job here.
 on:
-  push:
+  # Safe here: the jobs below run only for push events from this repository,
+  # never for pull requests from forks.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows:
+      - Build and test
+    types:
+      - completed
     branches:
       - main
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
+# Queue runs instead of cancelling them. A cancelled run could stop after the
+# tags moved but before Dokploy was told to deploy.
 concurrency:
-  group: publish-ghcr-${{ github.ref }}
-  cancel-in-progress: true
+  group: publish-ghcr
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
+  # workflow_run sets GITHUB_SHA to the latest default branch commit, so use
+  # the commit that CI actually tested.
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  RAILPACK_VERSION: v0.43.0
 
 jobs:
   build:
     name: Build ${{ matrix.arch }} image
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: true
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-26.04
+            railpack_target: x86_64-unknown-linux-musl
+            railpack_sha256: 248a8f60f36854aabed6124113631078a802de3461660855fc4de9c26065c1fb
           - arch: arm64
             runner: ubuntu-26.04-arm
+            railpack_target: arm64-unknown-linux-musl
+            railpack_sha256: 732ece14eb4f4676a43ebba19431f954edf7b130acb76159ef0f2ff86ac42ac9
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.HEAD_SHA }}
           persist-credentials: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -44,25 +68,30 @@ jobs:
 
       - name: Install Railpack
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAILPACK_TARGET: ${{ matrix.railpack_target }}
+          RAILPACK_SHA256: ${{ matrix.railpack_sha256 }}
         run: |
-          mkdir -p "$HOME/.local/bin"
-          curl --fail --silent --show-error --location https://railpack.com/install.sh | sh -s -- --bin-dir "$HOME/.local/bin"
-          "$HOME/.local/bin/railpack" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          archive="railpack-${RAILPACK_VERSION}-${RAILPACK_TARGET}.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/railwayapp/railpack/releases/download/${RAILPACK_VERSION}/${archive}"
+          echo "${RAILPACK_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" railpack
+          "$RUNNER_TEMP/railpack" --version
 
       - name: Start BuildKit
         run: |
-          docker run --rm --privileged -d --name railpack-buildkit moby/buildkit:latest
-          echo "BUILDKIT_HOST=docker-container://railpack-buildkit" >> "$GITHUB_ENV"
+          docker run --rm --privileged -d --name railpack-buildkit moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Build and push image with Railpack
         env:
           ARCH: ${{ matrix.arch }}
+          BUILDKIT_HOST: docker-container://railpack-buildkit
         run: |
-          tag="${REGISTRY}/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA::12}-${ARCH}"
+          tag="${REGISTRY}/${GITHUB_REPOSITORY,,}:sha-${HEAD_SHA::12}-${ARCH}"
 
-          railpack build --name "$tag" .
+          "$RUNNER_TEMP/railpack" build --name "$tag" .
           docker push "$tag"
 
       - name: Stop BuildKit
@@ -73,10 +102,12 @@ jobs:
     name: Publish multi-arch image
     needs: build
     runs-on: ubuntu-26.04
+    permissions:
+      packages: write
 
     steps:
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -85,7 +116,7 @@ jobs:
       - name: Create multi-arch manifest
         run: |
           image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
-          sha_tag="${image}:sha-${GITHUB_SHA::12}"
+          sha_tag="${image}:sha-${HEAD_SHA::12}"
 
           docker buildx imagetools create \
             --tag "$sha_tag" \
