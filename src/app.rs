@@ -18,7 +18,7 @@ use utoipa::{
     OpenApi,
     openapi::{OpenApi as OpenApiDocument, Server},
 };
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::{Config, SwaggerUi};
 
 use crate::{
     config::AppConfig,
@@ -100,10 +100,7 @@ pub fn build_app(
         .route("/mineskin/capes", get(supported_capes))
         .route("/mineskin/cape-support", get(cape_support))
         .route("/mineskin/decrypt-url", get(decrypt_url))
-        .merge(
-            Router::from(SwaggerUi::new("/swagger").url("/openapi", openapi))
-                .layer(middleware::map_response(swagger_not_found)),
-        )
+        .merge(Router::from(swagger_ui(openapi)).layer(middleware::map_response(swagger_not_found)))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -202,6 +199,20 @@ async fn guard_upload(
         Err(_) => ApiError::new(StatusCode::GATEWAY_TIMEOUT, "Skin upload request timed out")
             .into_response(),
     }
+}
+
+/// Serves the API document at `/openapi` and Swagger UI at `/swagger/`.
+///
+/// The base layout drops the "Explore" bar, which only invites loading other
+/// specs. The Schemas section starts collapsed so the operations come first,
+/// and each response shows how long it took, since uploads can take seconds.
+fn swagger_ui(openapi: OpenApiDocument) -> SwaggerUi {
+    SwaggerUi::new("/swagger").url("/openapi", openapi).config(
+        Config::default()
+            .use_base_layout()
+            .default_models_expand_depth(0)
+            .display_request_duration(true),
+    )
 }
 
 #[must_use]
