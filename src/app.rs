@@ -114,7 +114,9 @@ pub fn build_app(
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                 .allow_headers(Any),
         )
-        .layer(TraceLayer::new_for_http())
+        // ApiError logs failed responses with their cause, so skip TraceLayer's
+        // second error line for each 5xx.
+        .layer(TraceLayer::new_for_http().on_failure(()))
         .layer(middleware::from_fn_with_state(metrics, record_metrics));
 
     Ok(api)
