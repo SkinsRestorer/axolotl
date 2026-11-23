@@ -77,15 +77,16 @@ impl UrlCipher {
         let payload = encrypted_url
             .strip_prefix(ENCRYPTED_URL_SCHEME)
             .ok_or(CryptoError::InvalidFormat)?;
+        let key = self.key()?;
 
         if payload.len() > MAXIMUM_ENCODED_PAYLOAD_LENGTH {
             return Err(CryptoError::InvalidPayload);
         }
 
         let uuid = if let Some(payload) = payload.strip_prefix(AUTHENTICATED_PAYLOAD_PREFIX) {
-            self.decrypt_authenticated_uuid(payload)?
+            Self::decrypt_authenticated_uuid(key, payload)?
         } else {
-            self.decrypt_legacy_uuid(payload)?
+            Self::decrypt_legacy_uuid(key, payload)?
         };
         let uuid = canonical_uuid(&uuid).map_err(|_| CryptoError::InvalidPayload)?;
 
@@ -129,7 +130,7 @@ impl UrlCipher {
         clippy::map_err_ignore,
         reason = "invalid encrypted payloads share one error without exposing validation details"
     )]
-    fn decrypt_authenticated_uuid(&self, payload: &str) -> Result<String, CryptoError> {
+    fn decrypt_authenticated_uuid(key: &[u8; 32], payload: &str) -> Result<String, CryptoError> {
         let combined = URL_SAFE_NO_PAD
             .decode(payload)
             .map_err(|_| CryptoError::InvalidPayload)?;
@@ -142,7 +143,6 @@ impl UrlCipher {
             .ok_or(CryptoError::InvalidPayload)?;
         let nonce: &[u8; GCM_NONCE_LENGTH] =
             nonce.try_into().map_err(|_| CryptoError::InvalidPayload)?;
-        let key = self.key()?;
         let cipher = Aes256Gcm::new(&Array(*key));
         let plaintext = cipher
             .decrypt(
@@ -161,9 +161,12 @@ impl UrlCipher {
         clippy::map_err_ignore,
         reason = "invalid encrypted payloads share one error without exposing validation details"
     )]
-    fn decrypt_legacy_uuid(&self, payload: &str) -> Result<String, CryptoError> {
+    fn decrypt_legacy_uuid(key: &[u8; 32], payload: &str) -> Result<String, CryptoError> {
+        // Standard base64 can contain '+'. An unencoded '+' in a query string
+        // arrives as a space, and a space is never valid base64, so restoring it
+        // cannot change how any valid payload decodes.
         let mut combined = STANDARD
-            .decode(payload)
+            .decode(payload.replace(' ', "+"))
             .map_err(|_| CryptoError::InvalidPayload)?;
 
         if combined.len() < 32 || !combined.len().is_multiple_of(16) {
@@ -176,7 +179,6 @@ impl UrlCipher {
             .copied()
             .ok_or(CryptoError::InvalidPayload)?;
         combined.drain(..16);
-        let key = self.key()?;
         let plaintext_length = Aes256CbcDecryptor::new(key.into(), (&iv).into())
             .decrypt_padded::<Pkcs7>(&mut combined)
             .map_err(|_| CryptoError::InvalidPayload)?
@@ -235,7 +237,7 @@ impl UrlCipher {
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    #[error("AES_SECRET_KEY environment variable is not set")]
+    #[error("URL encryption is not configured")]
     MissingConfiguration,
     #[error("Invalid encrypted URL format")]
     InvalidFormat,
@@ -356,6 +358,125 @@ mod tests {
             cipher.encrypt_uuid("not-a-uuid"),
             Err(CryptoError::InvalidUuid)
         ));
+    }
+
+    fn assert_invalid_payload(cipher: &UrlCipher, payload: &str) {
+        assert!(
+            matches!(
+                cipher.decrypt_url(&format!("{ENCRYPTED_URL_SCHEME}{payload}")),
+                Err(CryptoError::InvalidPayload)
+            ),
+            "payload {payload:?} was not rejected as InvalidPayload"
+        );
+    }
+
+    #[test]
+    fn reports_missing_key_before_validating_payloads() {
+        let cipher = UrlCipher::new(None);
+
+        for payload in [LEGACY_PAYLOAD, "not base64!", "v2/AAAA"] {
+            assert!(matches!(
+                cipher.decrypt_url(&format!("{ENCRYPTED_URL_SCHEME}{payload}")),
+                Err(CryptoError::MissingConfiguration)
+            ));
+        }
+    }
+
+    #[test]
+    fn decrypts_legacy_payloads_with_unencoded_plus_signs() -> Result<(), CryptoError> {
+        let cipher = UrlCipher::new(Some("test-secret"));
+        let iv = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let encrypted = cipher.encrypt_uuid_with_iv(UUID, iv)?;
+        assert!(encrypted.contains('+'), "test vector must contain '+'");
+
+        let decrypted = cipher.decrypt_url(&encrypted.replace('+', " "))?;
+
+        assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{UUID}"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_payloads_encrypted_with_another_key() -> Result<(), CryptoError> {
+        let other = UrlCipher::new(Some("other-secret"));
+        let legacy = other.encrypt_uuid_with_iv(UUID, [7; 16])?;
+        let authenticated = other.encrypt_uuid_with_nonce(UUID, [7; GCM_NONCE_LENGTH])?;
+        let cipher = UrlCipher::new(Some("test-secret"));
+
+        for encrypted in [legacy, authenticated] {
+            let payload = encrypted
+                .strip_prefix(ENCRYPTED_URL_SCHEME)
+                .ok_or(CryptoError::InvalidFormat)?;
+            assert_invalid_payload(&cipher, payload);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_oversized_payloads() {
+        let cipher = UrlCipher::new(Some("test-secret"));
+
+        assert_invalid_payload(&cipher, &"A".repeat(MAXIMUM_ENCODED_PAYLOAD_LENGTH + 4));
+    }
+
+    #[test]
+    fn rejects_corrupted_legacy_payloads() -> Result<(), Box<dyn std::error::Error>> {
+        let cipher = UrlCipher::new(Some("test-secret"));
+        let mut combined = STANDARD.decode(LEGACY_PAYLOAD)?;
+        let last = combined.last_mut().ok_or(CryptoError::InvalidPayload)?;
+        *last ^= 1;
+
+        assert_invalid_payload(&cipher, &STANDARD.encode(&combined));
+        assert_invalid_payload(&cipher, LEGACY_PAYLOAD.trim_end_matches('='));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_v2_payloads_with_a_changed_nonce_or_format() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cipher = UrlCipher::new(Some("test-secret"));
+        let encrypted = cipher.encrypt_uuid_with_nonce(UUID, [0x2a; GCM_NONCE_LENGTH])?;
+        let payload = encrypted
+            .strip_prefix(&format!(
+                "{ENCRYPTED_URL_SCHEME}{AUTHENTICATED_PAYLOAD_PREFIX}"
+            ))
+            .ok_or(CryptoError::InvalidFormat)?;
+        let mut combined = URL_SAFE_NO_PAD.decode(payload)?;
+
+        assert_invalid_payload(&cipher, &STANDARD.encode(&combined));
+
+        let first = combined.first_mut().ok_or(CryptoError::InvalidPayload)?;
+        *first ^= 1;
+        assert_invalid_payload(
+            &cipher,
+            &format!(
+                "{AUTHENTICATED_PAYLOAD_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode(&combined)
+            ),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_non_canonical_uuids() -> Result<(), CryptoError> {
+        let cipher = UrlCipher::new(Some("test-secret"));
+        let expected = format!("{MINESKIN_URL_PREFIX}{UUID}");
+
+        for uuid in [
+            "123e4567e89b12d3a456426614174000",
+            "{123e4567-e89b-12d3-a456-426614174000}",
+            "urn:uuid:123e4567-e89b-12d3-a456-426614174000",
+            "123E4567-E89B-12D3-A456-426614174000",
+        ] {
+            assert_eq!(cipher.decrypt_url(&cipher.encrypt_uuid(uuid)?)?, expected);
+            assert_eq!(
+                cipher.decrypt_url(&cipher.encrypt_uuid_with_iv(uuid, [3; 16])?)?,
+                expected
+            );
+        }
+        Ok(())
     }
 
     #[test]
