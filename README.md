@@ -253,14 +253,15 @@ cargo run
 
 Open `http://localhost:3000/swagger` to try the API.
 
-## Deploy with Railpack
+## Build the image
 
-[Railpack](https://railpack.com/languages/rust) finds the root `Cargo.toml`, selects the Rust version from `rust-toolchain.toml`, builds the release binary, and starts `./bin/axolotl`. You do not need a custom build or start command.
+The [`Dockerfile`](Dockerfile) builds the release binary in a pinned Rust image and copies it into a pinned distroless image that runs as a non-root user. Pass `GIT_SHA` so the startup log shows the commit:
 
-1. Set `MINESKIN_API_KEY` and `AES_SECRET_KEY` in the deployment environment.
-2. Deploy the repository.
+```bash
+docker build --build-arg GIT_SHA="$(git rev-parse HEAD)" -t axolotl .
+```
 
-Railway sets `PORT`, and Axolotl listens on it. Use `/ready` as the health check path. If the build has no `GIT_SHA` variable, the startup log shows the commit as `unknown`.
+Platforms that build from the repository, such as Railway, use the `Dockerfile`. Set `MINESKIN_API_KEY` and `AES_SECRET_KEY` in the deployment environment. Axolotl listens on `PORT` when the platform sets it. Use `/ready` as the health check path.
 
 ## Run the published image
 

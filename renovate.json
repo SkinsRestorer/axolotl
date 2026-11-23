@@ -5,7 +5,7 @@
     ":semanticCommits",
     "helpers:pinGitHubActionDigests"
   ],
-  "enabledManagers": ["cargo", "github-actions", "rust-toolchain"],
+  "enabledManagers": ["cargo", "dockerfile", "github-actions", "rust-toolchain"],
   "packageRules": [
     {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],

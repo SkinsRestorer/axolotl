@@ -9,7 +9,7 @@ Search existing reports before opening another issue. Add new evidence to an exi
 
 ## Details that help
 
-Give the Axolotl commit or image tag and the deployment (hosted service, Docker image, or Railpack).
+Give the Axolotl commit or image tag and the deployment (hosted service, Docker image, or a platform that builds the `Dockerfile`).
 Give the method and path, the response status, and the JSON error body.
 
 Include the failing step, expected result, actual result, and a minimal reproduction.

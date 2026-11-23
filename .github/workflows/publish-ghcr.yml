@@ -27,7 +27,6 @@ env:
   # workflow_run sets GITHUB_SHA to the latest default branch commit, so use
   # the commit that CI actually tested.
   HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-  RAILPACK_VERSION: v0.43.0
 
 jobs:
   build:
@@ -46,12 +45,8 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-26.04
-            railpack_target: x86_64-unknown-linux-musl
-            railpack_sha256: 248a8f60f36854aabed6124113631078a802de3461660855fc4de9c26065c1fb
           - arch: arm64
             runner: ubuntu-26.04-arm
-            railpack_target: arm64-unknown-linux-musl
-            railpack_sha256: 732ece14eb4f4676a43ebba19431f954edf7b130acb76159ef0f2ff86ac42ac9
 
     steps:
       - name: Checkout repository
@@ -67,39 +62,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Railpack
-        env:
-          RAILPACK_TARGET: ${{ matrix.railpack_target }}
-          RAILPACK_SHA256: ${{ matrix.railpack_sha256 }}
-        run: |
-          archive="railpack-${RAILPACK_VERSION}-${RAILPACK_TARGET}.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --output "$RUNNER_TEMP/$archive" \
-            "https://github.com/railwayapp/railpack/releases/download/${RAILPACK_VERSION}/${archive}"
-          echo "${RAILPACK_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" railpack
-          "$RUNNER_TEMP/railpack" --version
-
-      - name: Start BuildKit
-        run: |
-          docker run --rm --privileged -d --name railpack-buildkit moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
-
-      - name: Build and push image with Railpack
+      - name: Prepare image tag
         env:
           ARCH: ${{ matrix.arch }}
-          BUILDKIT_HOST: docker-container://railpack-buildkit
-        run: |
-          tag="${REGISTRY}/${GITHUB_REPOSITORY,,}:sha-${HEAD_SHA::12}-${ARCH}"
+        run: echo "IMAGE_TAG=${REGISTRY}/${GITHUB_REPOSITORY,,}:sha-${HEAD_SHA::12}-${ARCH}" >> "$GITHUB_ENV"
 
-          # Railpack exposes --env values to the build steps, where cargo
-          # bakes GIT_SHA into the binary for the startup log.
-          "$RUNNER_TEMP/railpack" build --name "$tag" --env "GIT_SHA=${HEAD_SHA}" .
-          docker push "$tag"
-
-      - name: Stop BuildKit
-        if: always()
-        run: docker rm -f railpack-buildkit || true
+      # The GIT_SHA build argument bakes the commit into the binary for the startup log.
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.IMAGE_TAG }}
+          build-args: GIT_SHA=${{ env.HEAD_SHA }}
 
   publish:
     name: Publish multi-arch image

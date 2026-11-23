@@ -44,7 +44,7 @@ body:
   attributes:
     label: Version and deployment
     description: The Axolotl commit or image tag, and the deployment (hosted service, Docker image, or
-      Railpack). Include the method, path, response status, and JSON error body.
+      a platform that builds the Dockerfile). Include the method, path, response status, and JSON error body.
   validations:
     required: true
 - type: textarea
