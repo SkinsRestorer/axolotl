@@ -453,10 +453,11 @@ impl Default for LatencyHistogram {
 
 impl LatencyHistogram {
     fn record(&self, latency: Duration) {
-        let milliseconds = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+        // Compare the full duration so that, for example, 60.5 s lands in the
+        // >60 s bucket instead of being truncated into the 60 s bucket.
         let bucket = LATENCY_BUCKET_UPPER_BOUNDS_MS
             .iter()
-            .position(|upper_bound| milliseconds <= *upper_bound)
+            .position(|upper_bound| latency <= Duration::from_millis(*upper_bound))
             .unwrap_or(LATENCY_BUCKET_UPPER_BOUNDS_MS.len().saturating_sub(1));
         if let Some(counter) = self.buckets.get(bucket) {
             counter.fetch_add(1, Ordering::Relaxed);
@@ -590,5 +591,30 @@ mod tests {
             .snapshot()
             .since(&Metrics::default().snapshot(), Duration::from_mins(5));
         assert_eq!(window.upload.redirects, 1);
+    }
+
+    #[test]
+    fn puts_latencies_just_above_a_bucket_edge_in_the_next_bucket() {
+        let metrics = Metrics::default();
+        metrics.finish_mineskin_request(Duration::from_millis(5), false, false);
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.mineskin_latency.percentile(95),
+            Duration::from_millis(5)
+        );
+
+        let metrics = Metrics::default();
+        metrics.finish_mineskin_request(Duration::from_micros(5_400), false, false);
+        assert_eq!(
+            metrics.snapshot().mineskin_latency.percentile(95),
+            Duration::from_millis(10)
+        );
+
+        let metrics = Metrics::default();
+        metrics.finish_mineskin_request(Duration::from_micros(60_000_500), false, false);
+        assert_eq!(
+            metrics.snapshot().mineskin_latency.percentile(50),
+            Duration::from_millis(60_001)
+        );
     }
 }
