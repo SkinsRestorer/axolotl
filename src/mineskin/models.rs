@@ -11,9 +11,12 @@ use utoipa::ToSchema;
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct MineSkinErrorItem {
+    // Serde omits a missing value instead of writing null.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub message: Option<String>,
 }
 
@@ -206,6 +209,8 @@ pub struct Grants {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SanitizedResponse {
     pub success: bool,
+    // Serde writes null when there is no skin, so the key is always present.
+    #[schema(required = true)]
     pub skin: Option<SanitizedSkin>,
     pub warnings: Vec<MineSkinErrorItem>,
     pub messages: Vec<MineSkinErrorItem>,
@@ -235,4 +240,59 @@ pub struct CapeSupportResponse {
     pub has_cape_grant: bool,
     #[schema(value_type = Vec<Cape>)]
     pub capes: Arc<[Cape]>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use utoipa::ToSchema;
+
+    use super::{MineSkinErrorItem, SanitizedResponse};
+
+    fn schema_json<T: ToSchema>() -> Value {
+        serde_json::to_value(T::schema()).unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn sanitized_response_schema_requires_a_nullable_skin() {
+        let schema = schema_json::<SanitizedResponse>();
+        assert_eq!(
+            schema.pointer("/required"),
+            Some(&json!(["success", "skin", "warnings", "messages"]))
+        );
+        assert_eq!(
+            schema.pointer("/properties/skin/oneOf"),
+            Some(&json!([{ "$ref": "#/components/schemas/SanitizedSkin" }, { "type": "null" }]))
+        );
+
+        let serialized = serde_json::to_value(SanitizedResponse {
+            success: true,
+            skin: None,
+            warnings: Vec::new(),
+            messages: Vec::new(),
+        })
+        .unwrap_or(Value::Null);
+        assert_eq!(serialized.get("skin"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn error_item_schema_omits_absent_fields_instead_of_allowing_null() {
+        let schema = schema_json::<MineSkinErrorItem>();
+        assert_eq!(
+            schema.pointer("/properties/code"),
+            Some(&json!({ "type": "string" }))
+        );
+        assert_eq!(
+            schema.pointer("/properties/message"),
+            Some(&json!({ "type": "string" }))
+        );
+        assert!(schema.get("required").is_none());
+
+        let serialized = serde_json::to_value(MineSkinErrorItem {
+            code: None,
+            message: None,
+        })
+        .unwrap_or(Value::Null);
+        assert_eq!(serialized, json!({}));
+    }
 }
