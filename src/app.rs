@@ -7,7 +7,10 @@ use std::{
 use axum::{
     Router,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{HeaderName, HeaderValue, Method, StatusCode, header::LOCATION},
+    http::{
+        HeaderName, HeaderValue, Method, StatusCode,
+        header::{LOCATION, RETRY_AFTER},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -15,7 +18,7 @@ use axum::{
 use tokio::{sync::Semaphore, time::timeout};
 use tower_http::{
     cors::{Any, CorsLayer},
-    request_id::{MakeRequestUuid, RequestId, SetRequestIdLayer},
+    request_id::{MakeRequestId, MakeRequestUuid},
 };
 use tracing::{Instrument, debug, info, info_span};
 use utoipa::{
@@ -42,6 +45,9 @@ const MAXIMUM_REQUEST_BODY_SIZE: usize = 6 * 1024 * 1024;
 
 /// Cloudflare's ID for a request, which Axolotl reuses as its own request ID.
 const CF_RAY: HeaderName = HeaderName::from_static("cf-ray");
+/// The longest `cf-ray` value that Axolotl accepts as a request ID. Real ray
+/// IDs have about 20 characters, such as `8f1e2d3c4b5a6978-FRA`.
+const MAXIMUM_REQUEST_ID_LENGTH: usize = 64;
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// How long a client should wait before it retries an upload that was rejected
@@ -131,13 +137,13 @@ pub fn build_app(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers(Any),
+                .allow_headers(Any)
+                // Browsers hide other response headers from scripts unless
+                // they are exposed.
+                .expose_headers([X_REQUEST_ID, RETRY_AFTER]),
         )
         .layer(middleware::from_fn_with_state(metrics, record_metrics))
-        .layer(middleware::from_fn(log_request))
-        // Cloudflare sets `cf-ray` on every request it forwards. Requests that
-        // reach the container directly, such as probes, get a random ID.
-        .layer(SetRequestIdLayer::new(CF_RAY, MakeRequestUuid));
+        .layer(middleware::from_fn(log_request));
 
     Ok(api)
 }
@@ -164,23 +170,18 @@ fn missing_configuration(config: &AppConfig) -> Vec<&'static str> {
 /// The line has the path without the query string, because `decrypt-url`
 /// receives encrypted skin URLs in the query.
 async fn log_request(request: Request, next: Next) -> Response {
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .map(|id| id.header_value().clone());
+    let request_id = request_id(&request);
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let span = info_span!(
         "request",
-        request_id = %request_id
-            .as_ref()
-            .and_then(|id| id.to_str().ok())
-            .unwrap_or_default(),
+        request_id = %request_id.to_str().unwrap_or_default(),
     );
 
     let started_at = Instant::now();
     let mut response = next.run(request).instrument(span.clone()).await;
-    let latency_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    // Round to microseconds so the log shows 0.038, not 0.037873000000000004.
+    let latency_ms = (started_at.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0;
     let status = response.status().as_u16();
     span.in_scope(|| {
         if PROBE_PATHS.contains(&path.as_str()) {
@@ -190,10 +191,36 @@ async fn log_request(request: Request, next: Next) -> Response {
         }
     });
 
-    if let Some(request_id) = request_id {
-        response.headers_mut().insert(X_REQUEST_ID, request_id);
-    }
+    response.headers_mut().insert(X_REQUEST_ID, request_id);
     response
+}
+
+/// Returns the request's `cf-ray` value, or a random UUID when it has none.
+///
+/// Cloudflare sets `cf-ray` on every request it forwards. Requests that reach
+/// the container directly, such as probes, can send any value, so a value that
+/// does not look like a ray ID also gets a random UUID. This keeps long or
+/// unusual values out of the logs and the response headers.
+fn request_id(request: &Request) -> HeaderValue {
+    request
+        .headers()
+        .get(CF_RAY)
+        .filter(|value| is_valid_request_id(value.as_bytes()))
+        .cloned()
+        .or_else(|| {
+            MakeRequestUuid
+                .make_request_id(request)
+                .map(|id| id.header_value().clone())
+        })
+        // `MakeRequestUuid` always returns an ID.
+        .unwrap_or_else(|| HeaderValue::from_static("unknown"))
+}
+
+fn is_valid_request_id(value: &[u8]) -> bool {
+    (1..=MAXIMUM_REQUEST_ID_LENGTH).contains(&value.len())
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 async fn record_metrics(

@@ -18,7 +18,7 @@ pub struct HealthResponse {
     tag = "health",
     summary = "Check that the service is running.",
     responses(
-        (status = 200, description = "Successful response", body = HealthResponse)
+        (status = 200, description = "The process is running. This is a liveness check; use /ready to check configuration.", body = HealthResponse)
     )
 )]
 pub async fn health() -> Json<HealthResponse> {
