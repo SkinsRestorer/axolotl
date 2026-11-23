@@ -92,7 +92,9 @@ jobs:
         run: |
           tag="${REGISTRY}/${GITHUB_REPOSITORY,,}:sha-${HEAD_SHA::12}-${ARCH}"
 
-          "$RUNNER_TEMP/railpack" build --name "$tag" .
+          # Railpack exposes --env values to the build steps, where cargo
+          # bakes GIT_SHA into the binary for the startup log.
+          "$RUNNER_TEMP/railpack" build --name "$tag" --env "GIT_SHA=${HEAD_SHA}" .
           docker push "$tag"
 
       - name: Stop BuildKit

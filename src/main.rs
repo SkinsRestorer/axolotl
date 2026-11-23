@@ -13,7 +13,7 @@
 
 use std::{env, error::Error, io, net::SocketAddr, process::ExitCode, sync::Arc};
 
-use axolotl::{AppConfig, Metrics, build_app, reporter::DiscordReporter};
+use axolotl::{AppConfig, BUILD_COMMIT, Metrics, build_app, reporter::DiscordReporter};
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -45,7 +45,12 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         warn!("{warning}");
     }
     let port = config.port();
-    let metrics = Arc::new(Metrics::default());
+    // Client IPs are only read by the Discord report, so skip them without one.
+    let metrics = Arc::new(if config.discord_webhook().is_some() {
+        Metrics::default()
+    } else {
+        Metrics::without_client_tracking()
+    });
     let app = build_app(&config, Arc::clone(&metrics))?;
     let bind_address = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(bind_address)
@@ -56,6 +61,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Log only whether each optional feature is on. The values are secrets.
     info!(
         version = env!("CARGO_PKG_VERSION"),
+        commit = BUILD_COMMIT,
         %address,
         discord_reporting = config.discord_webhook().is_some(),
         mineskin_api_key = config.has_mineskin_api_key(),

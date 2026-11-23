@@ -5,9 +5,12 @@ use url::Url;
 
 const DEFAULT_PORT: u16 = 3000;
 const DEFAULT_MINESKIN_BASE_URL: &str = "https://api.mineskin.org/v2/";
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// An upload may take `DEFAULT_MAX_POLL_DURATION` plus three request timeouts
+// (body, cape check and queue request), so 84 s. The skinsrestorer.net site
+// gives up after 90 s and Cloudflare closes origin requests after about 100 s.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_MAX_POLL_DURATION: Duration = Duration::from_mins(5);
+const DEFAULT_MAX_POLL_DURATION: Duration = Duration::from_mins(1);
 const DEFAULT_CAPE_CACHE_TTL: Duration = Duration::from_mins(5);
 const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 16;
 
@@ -187,10 +190,25 @@ pub enum ConfigError {
 mod tests {
     use url::Url;
 
+    use std::time::Duration;
+
     use super::{
-        AppConfig, ConfigError, DEFAULT_PORT, parse_discord_webhook, parse_port,
-        read_environment_value,
+        AppConfig, ConfigError, DEFAULT_MAX_POLL_DURATION, DEFAULT_PORT, DEFAULT_REQUEST_TIMEOUT,
+        parse_discord_webhook, parse_port, read_environment_value,
     };
+
+    #[test]
+    fn upload_deadline_ends_before_clients_give_up() {
+        // skinsrestorer.net aborts Axolotl uploads after 90 s, before
+        // Cloudflare's roughly 100 s origin timeout.
+        let client_timeout = Duration::from_secs(90);
+        // Matches the upload deadline in `build_app`.
+        let deadline = DEFAULT_MAX_POLL_DURATION.saturating_add(DEFAULT_REQUEST_TIMEOUT * 3);
+        assert!(
+            deadline < client_timeout,
+            "the {deadline:?} upload deadline must end before the {client_timeout:?} client timeout"
+        );
+    }
 
     fn config_with_secrets(api_key: Option<&str>, aes_secret: Option<&str>) -> AppConfig {
         let base_url = Url::parse("https://example.com/").expect("the test URL is valid");
