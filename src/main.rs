@@ -11,7 +11,7 @@
     )
 )]
 
-use std::{env, error::Error, io, net::SocketAddr, sync::Arc};
+use std::{env, error::Error, io, net::SocketAddr, process::ExitCode, sync::Arc};
 
 use axolotl::{AppConfig, Metrics, build_app, reporter::DiscordReporter};
 use tokio::{net::TcpListener, signal};
@@ -19,7 +19,19 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // Returning the error from `main` would print its `Debug` form,
+            // which hides the messages written for operators.
+            eprintln!("Error: {}", error_chain(&*error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let dotenv = dotenvy::dotenv();
     init_tracing()?;
     if let Err(error) = dotenv
@@ -35,7 +47,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let port = config.port();
     let metrics = Arc::new(Metrics::default());
     let app = build_app(&config, Arc::clone(&metrics))?;
-    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let bind_address = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(bind_address).await.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to listen on {bind_address}: {error}"),
+        )
+    })?;
     // Log the bound address so `PORT=0` shows the port the OS picked.
     let address = listener.local_addr()?;
     let reporter = DiscordReporter::start(config.discord_webhook().cloned(), metrics);
@@ -59,11 +77,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+/// Formats an error and its sources as `outer: inner`. A source is skipped
+/// when the message already ends with it, because some errors repeat their
+/// source in their own message.
+fn error_chain(error: &(dyn Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let text = error.to_string();
+        if !message.ends_with(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = error.source();
+    }
+    message
+}
+
 fn init_tracing() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (filter, invalid_filter) = match EnvFilter::try_from_default_env() {
         Ok(filter) => (filter, None),
         Err(error) => (
-            EnvFilter::new("axolotl=info,tower_http=info"),
+            EnvFilter::new("axolotl=info"),
             env::var_os(EnvFilter::DEFAULT_ENV).map(|_| error),
         ),
     };
@@ -112,9 +147,38 @@ async fn terminate_signal() -> io::Result<()> {
 mod tests {
     use std::{io, time::Duration};
 
+    use axolotl::ConfigError;
+    use thiserror::Error;
     use tokio::time::timeout;
 
-    use super::wait_for_signal;
+    use super::{error_chain, wait_for_signal};
+
+    fn invalid_port() -> ConfigError {
+        ConfigError::InvalidPort {
+            value: "abc".to_owned(),
+            source: "abc".parse::<u16>().expect_err("abc is not a port"),
+        }
+    }
+
+    #[test]
+    fn startup_errors_show_messages_and_sources() {
+        assert_eq!(
+            error_chain(&invalid_port()),
+            "PORT must be a valid TCP port, received \"abc\": invalid digit found in string"
+        );
+    }
+
+    #[test]
+    fn startup_errors_skip_sources_already_in_the_message() {
+        #[derive(Debug, Error)]
+        #[error("startup failed: {0}")]
+        struct Wrapper(#[source] ConfigError);
+
+        assert_eq!(
+            error_chain(&Wrapper(invalid_port())),
+            "startup failed: PORT must be a valid TCP port, received \"abc\": invalid digit found in string"
+        );
+    }
 
     #[tokio::test]
     async fn completes_when_the_signal_arrives() {
