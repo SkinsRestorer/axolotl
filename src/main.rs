@@ -37,7 +37,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Err(error) = dotenv
         && !error.not_found()
     {
-        warn!(%error, "Failed to load .env");
+        warn!(error = %dotenv_error_message(&error), "Failed to load .env");
     }
 
     let config = AppConfig::from_env()?;
@@ -48,22 +48,26 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let metrics = Arc::new(Metrics::default());
     let app = build_app(&config, Arc::clone(&metrics))?;
     let bind_address = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(bind_address).await.map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("failed to listen on {bind_address}: {error}"),
-        )
-    })?;
+    let listener = TcpListener::bind(bind_address)
+        .await
+        .map_err(|error| bind_error(bind_address, &error))?;
     // Log the bound address so `PORT=0` shows the port the OS picked.
     let address = listener.local_addr()?;
-    let reporter = DiscordReporter::start(config.discord_webhook().cloned(), metrics);
-    drop(config);
-
-    info!(%address, "Axolotl server started");
+    // Log only whether each optional feature is on. The values are secrets.
     info!(
-        url = %format!("http://{address}/swagger"),
+        version = env!("CARGO_PKG_VERSION"),
+        %address,
+        discord_reporting = config.discord_webhook().is_some(),
+        mineskin_api_key = config.has_mineskin_api_key(),
+        aes_secret_key = config.has_aes_secret_key(),
+        "Axolotl server started"
+    );
+    info!(
+        url = %docs_url(address.port()),
         "API documentation available"
     );
+    let reporter = DiscordReporter::start(config.discord_webhook().cloned(), metrics);
+    drop(config);
 
     let server_result = axum::serve(
         listener,
@@ -75,6 +79,41 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     server_result?;
 
     Ok(())
+}
+
+/// The server listens on all interfaces, but `0.0.0.0` is not an address a
+/// browser can open, so the logged link points at the local machine.
+fn docs_url(port: u16) -> String {
+    format!("http://localhost:{port}/swagger")
+}
+
+/// Adds a hint for the bind failures that operators can fix themselves.
+fn bind_error(address: SocketAddr, error: &io::Error) -> io::Error {
+    let kind = error.kind();
+    let hint = if kind == io::ErrorKind::AddrInUse {
+        "; another process uses this port, so stop it or set PORT to a free port"
+    } else if kind == io::ErrorKind::PermissionDenied {
+        "; ports below 1024 need extra privileges, so set PORT to 1024 or higher"
+    } else {
+        ""
+    };
+    io::Error::new(
+        error.kind(),
+        format!("failed to listen on {address}: {error}{hint}"),
+    )
+}
+
+/// Describes a `.env` failure. A parse error from `dotenvy` contains the whole
+/// line, which can hold a secret, so that line is left out.
+fn dotenv_error_message(error: &dotenvy::Error) -> String {
+    if let dotenvy::Error::LineParse(_, index) = error {
+        format!(
+            "a line could not be parsed at character {index}, so it and the lines after it \
+             were not loaded (the line is not shown because it can contain a secret)"
+        )
+    } else {
+        error.to_string()
+    }
 }
 
 /// Formats an error and its sources as `outer: inner`. A source is skipped
@@ -145,13 +184,17 @@ async fn terminate_signal() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, time::Duration};
+    use std::{
+        io,
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
 
     use axolotl::ConfigError;
     use thiserror::Error;
     use tokio::time::timeout;
 
-    use super::{error_chain, wait_for_signal};
+    use super::{bind_error, docs_url, dotenv_error_message, error_chain, wait_for_signal};
 
     fn invalid_port() -> ConfigError {
         ConfigError::InvalidPort {
@@ -164,7 +207,7 @@ mod tests {
     fn startup_errors_show_messages_and_sources() {
         assert_eq!(
             error_chain(&invalid_port()),
-            "PORT must be a valid TCP port, received \"abc\": invalid digit found in string"
+            "PORT must be a TCP port number from 0 to 65535, received \"abc\": invalid digit found in string"
         );
     }
 
@@ -176,8 +219,54 @@ mod tests {
 
         assert_eq!(
             error_chain(&Wrapper(invalid_port())),
-            "startup failed: PORT must be a valid TCP port, received \"abc\": invalid digit found in string"
+            "startup failed: PORT must be a TCP port number from 0 to 65535, received \"abc\": invalid digit found in string"
         );
+    }
+
+    #[test]
+    fn links_the_api_docs_on_localhost() {
+        assert_eq!(docs_url(3000), "http://localhost:3000/swagger");
+    }
+
+    #[test]
+    fn bind_errors_explain_how_to_fix_common_causes() {
+        let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80));
+        let in_use = bind_error(address, &io::Error::from(io::ErrorKind::AddrInUse));
+        assert_eq!(in_use.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            in_use
+                .to_string()
+                .starts_with("failed to listen on 0.0.0.0:80: ")
+                && in_use.to_string().ends_with(
+                    "; another process uses this port, so stop it or set PORT to a free port"
+                ),
+            "unexpected message: {in_use}"
+        );
+
+        let denied = bind_error(address, &io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(
+            denied.to_string().ends_with(
+                "; ports below 1024 need extra privileges, so set PORT to 1024 or higher"
+            ),
+            "unexpected message: {denied}"
+        );
+
+        let other = bind_error(address, &io::Error::other("boom"));
+        assert_eq!(other.to_string(), "failed to listen on 0.0.0.0:80: boom");
+    }
+
+    #[test]
+    fn dotenv_parse_errors_hide_the_line() {
+        let error = dotenvy::Error::LineParse("AES_SECRET_KEY=hunter2 'x".to_owned(), 22);
+        let message = dotenv_error_message(&error);
+        assert!(!message.contains("hunter2"), "the line leaked: {message}");
+        assert!(
+            message.contains("character 22"),
+            "unexpected message: {message}"
+        );
+
+        let io_error = dotenvy::Error::Io(io::Error::other("disk on fire"));
+        assert_eq!(dotenv_error_message(&io_error), "disk on fire");
     }
 
     #[tokio::test]
