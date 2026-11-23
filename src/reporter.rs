@@ -456,6 +456,10 @@ fn format_latency(duration: Duration) -> String {
     if duration.is_zero() {
         return "N/A".to_owned();
     }
+    // Whole milliseconds would show fast endpoints such as decryption as "0 ms".
+    if duration < Duration::from_millis(1) {
+        return "<1 ms".to_owned();
+    }
     if duration < Duration::from_secs(1) {
         return format!("{} ms", duration.as_millis());
     }
@@ -495,7 +499,17 @@ mod tests {
     use url::Url;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-    use super::{ClientInsight, Metrics, MetricsSnapshot, build_report, run, send_report};
+    use super::{
+        ClientInsight, Metrics, MetricsSnapshot, build_report, format_latency, run, send_report,
+    };
+
+    #[test]
+    fn shows_sub_millisecond_latency_as_nonzero() {
+        assert_eq!(format_latency(Duration::ZERO), "N/A");
+        assert_eq!(format_latency(Duration::from_micros(400)), "<1 ms");
+        assert_eq!(format_latency(Duration::from_micros(1_500)), "1 ms");
+        assert_eq!(format_latency(Duration::from_millis(1_250)), "1.25 s");
+    }
 
     #[test]
     fn identifies_distributed_and_dominant_client_traffic() {
