@@ -148,7 +148,7 @@ pub async fn upload_skin(
         .mineskin
         .enqueue(upload)
         .await
-        .map_err(map_upload_error)?;
+        .map_err(map_enqueue_error)?;
     let response = state
         .mineskin
         .poll_job(&job.id, poll_interval)
@@ -280,8 +280,10 @@ pub async fn decrypt_url(
     State(state): State<Arc<AppState>>,
     query: Result<Query<DecryptUrlQuery>, QueryRejection>,
 ) -> Result<Json<DecryptedUrlResponse>, ApiError> {
-    let Query(query) = query
-        .map_err(|error| ApiError::bad_request("encryptedUrl is required").with_source(error))?;
+    let Query(query) = query.map_err(|error| {
+        // encryptedUrl is the only parameter, so it is missing or repeated.
+        ApiError::bad_request("encryptedUrl must be provided exactly once").with_source(error)
+    })?;
     let url = state
         .cipher
         .decrypt_url(&query.encrypted_url)
@@ -311,10 +313,14 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
         };
 
         match field_name.as_str() {
-            "file" if file.is_none() && field.file_name().is_some() => {
+            // The file name is optional: the MineSkin client falls back to "skin.png".
+            "file" if file.is_none() => {
                 let file_name = field.file_name().map(str::to_owned);
                 let content_type = field.content_type().map(str::to_owned);
                 let bytes = field.bytes().await.map_err(map_multipart_error)?;
+                if bytes.is_empty() {
+                    return Err(ApiError::bad_request("A skin file must be provided"));
+                }
                 if bytes.len() > MAXIMUM_FILE_SIZE {
                     return Err(ApiError::new(
                         StatusCode::PAYLOAD_TOO_LARGE,
@@ -412,22 +418,35 @@ fn validate_poll_interval(milliseconds: u64) -> Result<Duration, ApiError> {
     Ok(Duration::from_millis(milliseconds))
 }
 
+/// Maps the queue request error. Only this request carries the client's skin,
+/// so only its 400 means that the client sent something invalid.
+fn map_enqueue_error(error: MineSkinClientError) -> ApiError {
+    let is_client_error = matches!(error, MineSkinClientError::InvalidUpload(_))
+        || error.upstream_status() == Some(StatusCode::BAD_REQUEST);
+    if is_client_error {
+        return mineskin_error(error, StatusCode::BAD_REQUEST);
+    }
+
+    map_upload_error(error)
+}
+
+/// Maps errors of the other upload steps. A 400 from the cape list or a job
+/// status poll means the proxy sent a bad request, not the client, so it
+/// becomes a 502.
 fn map_upload_error(error: MineSkinClientError) -> ApiError {
     let status = if error.is_configuration_error() {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
         match &error {
             MineSkinClientError::Configuration(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            MineSkinClientError::InvalidUpload(_) => StatusCode::BAD_REQUEST,
             MineSkinClientError::Upstream { status, .. } => match *status {
-                StatusCode::BAD_REQUEST
-                | StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::GATEWAY_TIMEOUT => *status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::GATEWAY_TIMEOUT => *status,
                 _ => StatusCode::BAD_GATEWAY,
             },
             MineSkinClientError::Request(_)
             | MineSkinClientError::UnexpectedResponse { .. }
-            | MineSkinClientError::Crypto(_) => StatusCode::BAD_GATEWAY,
+            | MineSkinClientError::Crypto(_)
+            | MineSkinClientError::InvalidUpload(_) => StatusCode::BAD_GATEWAY,
         }
     };
 
