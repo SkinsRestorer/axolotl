@@ -112,6 +112,7 @@ pub fn build_app(
         .route("/mineskin/decrypt-url", get(decrypt_url))
         .merge(SwaggerUi::new("/swagger").url("/openapi", openapi))
         .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAXIMUM_REQUEST_BODY_SIZE))
         .layer(
@@ -216,11 +217,19 @@ async fn root() -> impl IntoResponse {
 }
 
 async fn not_found() -> impl IntoResponse {
+    json_error(StatusCode::NOT_FOUND, "Not Found")
+}
+
+async fn method_not_allowed() -> impl IntoResponse {
+    json_error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+}
+
+fn json_error(status: StatusCode, error: &str) -> impl IntoResponse {
     (
-        StatusCode::NOT_FOUND,
+        status,
         [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
         Json(ErrorResponse {
-            error: "Not Found".to_owned(),
+            error: error.to_owned(),
         }),
     )
 }
