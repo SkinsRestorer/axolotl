@@ -31,7 +31,8 @@ use crate::{
 };
 
 use super::models::{
-    Cape, JobDetails, JobStatus, JobSuccessResponse, MineSkinResponse, SanitizedResponse,
+    Cape, JobDetails, JobStatus, JobSuccessResponse, MineSkinErrorItem, MineSkinResponse,
+    SanitizedResponse,
 };
 
 const MINESKIN_USER_AGENT: &str = "Axolotl-MineSkin-Proxy/1.0";
@@ -81,9 +82,21 @@ impl MineSkinClient {
     }
 
     pub async fn fetch_job(&self, job_id: &str) -> Result<JobSuccessResponse, MineSkinClientError> {
+        self.fetch_job_with_errors(job_id)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Fetches a job and keeps the upstream `errors` list, which `MineSkin`
+    /// uses to explain why a job failed.
+    async fn fetch_job_with_errors(
+        &self,
+        job_id: &str,
+    ) -> Result<(JobSuccessResponse, Option<Vec<MineSkinErrorItem>>), MineSkinClientError> {
         let url = self.job_endpoint(job_id)?;
         let request = self.authorize(self.http.get(url))?;
         let mut response = self.execute(request, "MineSkin job response").await?;
+        let errors = response.errors.take();
         let job = response.job.take().ok_or_else(|| {
             MineSkinClientError::unexpected("MineSkin job response", "job is missing")
         })?;
@@ -98,7 +111,7 @@ impl MineSkinClient {
             .validate()
             .map_err(|message| MineSkinClientError::unexpected("MineSkin job response", message))?;
 
-        Ok(response)
+        Ok((response, errors))
     }
 
     pub async fn poll_job(
@@ -107,8 +120,19 @@ impl MineSkinClient {
         poll_interval: Duration,
     ) -> Result<SanitizedResponse, MineSkinClientError> {
         let poll = async {
+            let mut warned_unknown_status = false;
             loop {
-                let response = self.fetch_job(job_id).await?;
+                // The job is already queued, so a transient failure must not
+                // abort the upload. Retrying the upload would queue a duplicate.
+                let (response, errors) = match self.fetch_job_with_errors(job_id).await {
+                    Ok(result) => result,
+                    Err(error) if error.is_transient() => {
+                        warn!(%error, job_id, "Retrying MineSkin job status after a transient error");
+                        sleep(poll_interval).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 match response.job.status {
                     JobStatus::Completed => {
@@ -121,15 +145,29 @@ impl MineSkinClient {
                         return self.sanitize_job(response);
                     }
                     JobStatus::Failed => {
+                        let message = errors
+                            .into_iter()
+                            .flatten()
+                            .find_map(|item| item.message)
+                            .unwrap_or_else(|| "MineSkin job failed to complete".to_owned());
                         return Err(MineSkinClientError::upstream(
                             StatusCode::BAD_GATEWAY,
-                            "MineSkin job failed to complete",
+                            message,
                         ));
                     }
-                    JobStatus::Unknown
-                    | JobStatus::Waiting
-                    | JobStatus::Active
-                    | JobStatus::Processing => sleep(poll_interval).await,
+                    JobStatus::Unknown => {
+                        if !warned_unknown_status {
+                            warn!(
+                                job_id,
+                                "MineSkin returned an unknown job status; still polling"
+                            );
+                            warned_unknown_status = true;
+                        }
+                        sleep(poll_interval).await;
+                    }
+                    JobStatus::Waiting | JobStatus::Active | JobStatus::Processing => {
+                        sleep(poll_interval).await;
+                    }
                 }
             }
         };
@@ -363,7 +401,6 @@ impl MineSkinClient {
         request: RequestBuilder,
         context: &'static str,
     ) -> Result<MineSkinResponse, MineSkinClientError> {
-        self.metrics.begin_mineskin_request();
         let started_at = Instant::now();
         let result = async {
             let response = request.send().await.map_err(MineSkinClientError::Request)?;
@@ -655,6 +692,21 @@ impl MineSkinClientError {
         }
     }
 
+    /// Returns whether a job status request may succeed when retried:
+    /// request failures, timeouts, rate limits, and upstream server errors.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(_) => true,
+            Self::Upstream { status, .. } => {
+                *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+            }
+            Self::Configuration(_)
+            | Self::UnexpectedResponse { .. }
+            | Self::Crypto(_)
+            | Self::InvalidUpload(_) => false,
+        }
+    }
+
     #[must_use]
     pub const fn is_configuration_error(&self) -> bool {
         matches!(
@@ -782,6 +834,203 @@ mod tests {
         let url = client.job_endpoint("job/with?syntax")?;
 
         assert_eq!(url.path(), "/v2/queue/job%2Fwith%3Fsyntax");
+        Ok(())
+    }
+
+    const SKIN_UUID: &str = "123e4567-e89b-12d3-a456-426614174002";
+
+    fn poll_test_client(
+        server: &MockServer,
+        max_poll_duration: Duration,
+    ) -> Result<MineSkinClient, Box<dyn Error + Send + Sync>> {
+        let mut config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+        config.max_poll_duration = max_poll_duration;
+        Ok(MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?)
+    }
+
+    async fn mount_job_response(server: &MockServer, priority: u8, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/v2/queue/job-poll"))
+            .respond_with(response)
+            .with_priority(priority)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn completed_job() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "job": { "id": "job-poll", "status": "completed", "result": SKIN_UUID },
+            "skin": { "uuid": SKIN_UUID }
+        }))
+    }
+
+    #[tokio::test]
+    async fn keeps_polling_after_transient_job_status_errors() -> TestResult {
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(429).set_body_json(json!({
+                "success": false,
+                "errors": [{ "message": "rate limited" }]
+            })),
+        )
+        .await;
+        mount_job_response(
+            &server,
+            2,
+            ResponseTemplate::new(503).set_body_string("<html>unavailable</html>"),
+        )
+        .await;
+        mount_job_response(
+            &server,
+            3,
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+        )
+        .await;
+        mount_job_response(&server, 4, completed_job()).await;
+        let mut config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+        config.request_timeout = Duration::from_millis(100);
+        let client = MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?;
+
+        let response = client.poll_job("job-poll", Duration::ZERO).await?;
+
+        assert!(response.skin.is_some());
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stops_polling_on_client_errors() -> TestResult {
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(404).set_body_json(json!({
+                "success": false,
+                "errors": [{ "code": "job_not_found", "message": "Job not found" }]
+            })),
+        )
+        .await;
+        let client = poll_test_client(&server, Duration::from_secs(1))?;
+
+        let result = client.poll_job("job-poll", Duration::ZERO).await;
+
+        assert!(matches!(
+            result,
+            Err(MineSkinClientError::Upstream { status: StatusCode::NOT_FOUND, ref message })
+                if message == "Job not found"
+        ));
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn times_out_when_job_status_errors_persist() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/queue/job-poll"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+        let client = poll_test_client(&server, Duration::from_millis(200))?;
+
+        let result = client.poll_job("job-poll", Duration::from_millis(10)).await;
+
+        assert!(matches!(
+            result,
+            Err(MineSkinClientError::Upstream {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_the_upstream_reason_for_failed_jobs() -> TestResult {
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "messages": [{ "code": "job_failed", "message": "Job failed" }],
+                "job": { "id": "job-poll", "status": "failed" },
+                "errors": [{ "code": "invalid_image", "message": "Invalid skin image" }]
+            })),
+        )
+        .await;
+        let client = poll_test_client(&server, Duration::from_secs(1))?;
+
+        let result = client.poll_job("job-poll", Duration::ZERO).await;
+
+        assert!(matches!(
+            result,
+            Err(MineSkinClientError::Upstream { status: StatusCode::BAD_GATEWAY, ref message })
+                if message == "Invalid skin image"
+        ));
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keeps_the_generic_message_for_failed_jobs_without_errors() -> TestResult {
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "job": { "id": "job-poll", "status": "failed" }
+            })),
+        )
+        .await;
+        let client = poll_test_client(&server, Duration::from_secs(1))?;
+
+        let result = client.poll_job("job-poll", Duration::ZERO).await;
+
+        assert!(matches!(
+            result,
+            Err(MineSkinClientError::Upstream { status: StatusCode::BAD_GATEWAY, ref message })
+                if message == "MineSkin job failed to complete"
+        ));
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keeps_polling_through_unknown_job_statuses() -> TestResult {
+        let server = MockServer::start().await;
+        for priority in 1..=2 {
+            mount_job_response(
+                &server,
+                priority,
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "job": { "id": "job-poll", "status": "rendering" }
+                })),
+            )
+            .await;
+        }
+        mount_job_response(&server, 3, completed_job()).await;
+        let client = poll_test_client(&server, Duration::from_secs(1))?;
+
+        let response = client.poll_job("job-poll", Duration::ZERO).await?;
+
+        assert!(response.skin.is_some());
+        server.verify().await;
         Ok(())
     }
 }
