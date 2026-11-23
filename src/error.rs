@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use tracing::{debug, error};
 use utoipa::ToSchema;
 
 #[derive(Debug)]
@@ -40,11 +41,6 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
-
-    #[must_use]
-    pub fn bad_gateway(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_GATEWAY, message)
-    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -63,6 +59,19 @@ impl std::error::Error for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let status = self.status.as_u16();
+        let source = self
+            .source
+            .as_deref()
+            .map(|source| source as &dyn std::error::Error);
+        if self.status.is_server_error() {
+            // Upstream failures are also logged where they happen, with their own
+            // context. This line records the response that the client receives.
+            error!(status, message = %self.message, error = source, "Request failed");
+        } else if let Some(source) = source {
+            debug!(status, message = %self.message, error = source, "Request rejected");
+        }
+
         (
             self.status,
             Json(ErrorResponse {
@@ -76,4 +85,50 @@ impl IntoResponse for ApiError {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        serde_json::from_slice(&bytes).expect("body should be JSON")
+    }
+
+    #[tokio::test]
+    async fn server_error_keeps_status_and_body() {
+        let response = ApiError::new(StatusCode::GATEWAY_TIMEOUT, "Skin upload request timed out")
+            .with_source(std::io::Error::other("deadline elapsed"))
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "error": "Skin upload request timed out" })
+        );
+    }
+
+    #[tokio::test]
+    async fn client_error_keeps_status_and_body() {
+        let response = ApiError::bad_request("Failed to parse multipart form data")
+            .with_source(std::io::Error::other("unexpected end of stream"))
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "error": "Failed to parse multipart form data" })
+        );
+    }
+
+    #[test]
+    fn source_is_exposed_through_error_trait() {
+        let error = ApiError::internal("failed").with_source(std::io::Error::other("cause"));
+
+        let source = std::error::Error::source(&error).expect("source should be set");
+        assert_eq!(source.to_string(), "cause");
+    }
 }
