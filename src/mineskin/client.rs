@@ -36,7 +36,8 @@ use super::models::{
 
 const MINESKIN_USER_AGENT: &str = "Axolotl-MineSkin-Proxy/1.0";
 const MAXIMUM_UPSTREAM_RESPONSE_SIZE: usize = 1024 * 1024;
-const CAPE_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
+const FAILURE_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAXIMUM_POLL_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 pub struct MineSkinClient {
     http: Client,
@@ -45,7 +46,7 @@ pub struct MineSkinClient {
     cipher: UrlCipher,
     metrics: Arc<Metrics>,
     cache: CapeCache,
-    grant_cache: RwLock<Option<(bool, Instant)>>,
+    grant_cache: Mutex<GrantCacheState>,
     default_poll_interval: Duration,
     max_poll_duration: Duration,
     cape_cache_ttl: Duration,
@@ -69,7 +70,7 @@ impl MineSkinClient {
             cipher,
             metrics,
             cache: CapeCache::default(),
-            grant_cache: RwLock::new(None),
+            grant_cache: Mutex::default(),
             default_poll_interval: config.default_poll_interval,
             max_poll_duration: config.max_poll_duration,
             cape_cache_ttl: config.cape_cache_ttl,
@@ -120,6 +121,7 @@ impl MineSkinClient {
     ) -> Result<SanitizedResponse, MineSkinClientError> {
         let poll = async {
             let mut warned_unknown_status = false;
+            let mut retry_delay = poll_interval;
             loop {
                 // The job is already queued, so a transient failure must not
                 // abort the upload. Retrying the upload would queue a duplicate.
@@ -127,11 +129,18 @@ impl MineSkinClient {
                     Ok(result) => result,
                     Err(error) if error.is_transient() => {
                         warn!(%error, job_id, "Retrying MineSkin job status after a transient error");
-                        sleep(poll_interval).await;
+                        // Back off so a rate-limited or failing MineSkin is not polled
+                        // at the client's chosen interval.
+                        sleep(retry_delay).await;
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(MAXIMUM_POLL_RETRY_DELAY)
+                            .max(poll_interval);
                         continue;
                     }
                     Err(error) => return Err(error),
                 };
+                retry_delay = poll_interval;
 
                 match response.job.status {
                     JobStatus::Completed => {
@@ -275,7 +284,7 @@ impl MineSkinClient {
                 Ok(capes)
             }
             Err(error) => {
-                self.cache.state.write().await.last_failure = Some(CachedCapeFailure::new(&error));
+                self.cache.state.write().await.last_failure = Some(CachedFailure::new(&error));
                 drop(refresh);
 
                 if let Some(cached) = cached {
@@ -292,14 +301,14 @@ impl MineSkinClient {
         self.cache.state.read().await.value.clone()
     }
 
-    async fn recent_cache_failure(&self) -> Option<CachedCapeFailure> {
+    async fn recent_cache_failure(&self) -> Option<CachedFailure> {
         self.cache
             .state
             .read()
             .await
             .last_failure
             .as_ref()
-            .filter(|failure| failure.failed_at.elapsed() < CAPE_REFRESH_RETRY_DELAY)
+            .filter(|failure| failure.is_recent())
             .cloned()
     }
 
@@ -309,16 +318,46 @@ impl MineSkinClient {
 
     /// Returns whether the account may use capes. The answer is cached for the
     /// cape cache TTL, because grants change rarely and every call costs a
-    /// `MineSkin` request.
+    /// `MineSkin` request. The lock is held during the request, so callers that
+    /// wait for it share its result, including a failure. Later callers retry.
     pub async fn has_cape_grant(&self) -> Result<bool, MineSkinClientError> {
-        if let Some((has_grant, fetched_at)) = *self.grant_cache.read().await
+        let called_at = Instant::now();
+        let mut cache = self.grant_cache.lock().await;
+        if let Some((has_grant, fetched_at)) = cache.value
             && fetched_at.elapsed() < self.cape_cache_ttl
         {
             return Ok(has_grant);
         }
-        let has_grant = self.fetch_cape_grant().await?;
-        *self.grant_cache.write().await = Some((has_grant, Instant::now()));
-        Ok(has_grant)
+        // After a failure, wait before asking MineSkin again, as the cape cache
+        // does, so a failing /me is not called once per client request. Serve
+        // the last known grant meanwhile.
+        let stale = cache.value.map(|(has_grant, _)| has_grant);
+        if let Some(failure) = cache
+            .last_failure
+            .as_ref()
+            .filter(|failure| failure.failed_at > called_at || failure.is_recent())
+        {
+            return stale.ok_or_else(|| failure.to_error());
+        }
+
+        let result = match self.fetch_cape_grant().await {
+            Ok(has_grant) => {
+                cache.value = Some((has_grant, Instant::now()));
+                cache.last_failure = None;
+                Ok(has_grant)
+            }
+            Err(error) => {
+                cache.last_failure = Some(CachedFailure::new(&error));
+                if let Some(has_grant) = stale {
+                    warn!(%error, "Failed to refresh the MineSkin cape grant; serving stale data");
+                    Ok(has_grant)
+                } else {
+                    Err(error)
+                }
+            }
+        };
+        drop(cache);
+        result
     }
 
     async fn fetch_cape_grant(&self) -> Result<bool, MineSkinClientError> {
@@ -476,52 +515,72 @@ struct CapeCache {
 #[derive(Default)]
 struct CapeCacheState {
     value: Option<Arc<CachedCapes>>,
-    last_failure: Option<CachedCapeFailure>,
+    last_failure: Option<CachedFailure>,
 }
 
+#[derive(Default)]
+struct GrantCacheState {
+    value: Option<(bool, Instant)>,
+    last_failure: Option<CachedFailure>,
+}
+
+/// A failed `MineSkin` request, kept so other callers can get the same error
+/// without another request.
 #[derive(Clone)]
-struct CachedCapeFailure {
+struct CachedFailure {
     failed_at: Instant,
     configuration_error: bool,
-    upstream_status: Option<StatusCode>,
+    upstream_status: StatusCode,
     message: String,
 }
 
-impl CachedCapeFailure {
+impl CachedFailure {
     fn new(error: &MineSkinClientError) -> Self {
+        // reqwest includes the upstream URL in its error text, so keep only the
+        // generic message that clients see for transport errors.
+        let message = match error {
+            MineSkinClientError::Request(_) => "MineSkin request failed".to_owned(),
+            MineSkinClientError::Configuration(_)
+            | MineSkinClientError::UnexpectedResponse { .. }
+            | MineSkinClientError::Upstream { .. }
+            | MineSkinClientError::Crypto(_)
+            | MineSkinClientError::InvalidUpload(_) => error.to_string(),
+        };
         Self {
             failed_at: Instant::now(),
             configuration_error: error.is_configuration_error(),
-            upstream_status: error.upstream_status(),
-            message: error.to_string(),
+            upstream_status: error.upstream_status().unwrap_or(StatusCode::BAD_GATEWAY),
+            message,
         }
+    }
+
+    fn is_recent(&self) -> bool {
+        self.failed_at.elapsed() < FAILURE_RETRY_DELAY
     }
 
     fn to_error(&self) -> MineSkinClientError {
         if self.configuration_error {
             return MineSkinClientError::Configuration(self.message.clone());
         }
-        if let Some(status) = self.upstream_status {
-            return MineSkinClientError::upstream(status, self.message.clone());
-        }
 
-        MineSkinClientError::unexpected("MineSkin cape response", self.message.clone())
+        MineSkinClientError::upstream(self.upstream_status, self.message.clone())
     }
 }
 
 /// Builds the `MineSkin` authorization header. Returns `None` when the key is
 /// missing, blank, or not a valid header value; the startup warnings say which.
-fn authorization_header(api_key: Option<&str>) -> Option<HeaderValue> {
+pub(crate) fn authorization_header(api_key: Option<&str>) -> Option<HeaderValue> {
     let raw_key = api_key?.trim();
-    if raw_key.is_empty() || raw_key.eq_ignore_ascii_case("Bearer") {
+    // Accept the key with or without a "Bearer " prefix, in any letter case.
+    let token = raw_key
+        .get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+        .and_then(|_| raw_key.get(7..))
+        .map_or(raw_key, str::trim_start);
+    if token.is_empty() || token.eq_ignore_ascii_case("bearer") {
         return None;
     }
-    let authorization = if raw_key.starts_with("Bearer ") {
-        raw_key.to_owned()
-    } else {
-        format!("Bearer {raw_key}")
-    };
-    let mut header = HeaderValue::from_str(&authorization).ok()?;
+    let mut header = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
     header.set_sensitive(true);
     Some(header)
 }
@@ -806,7 +865,13 @@ mod tests {
                 "{key:?} should not produce a header"
             );
         }
-        for key in ["secret", " secret ", "Bearer secret"] {
+        for key in [
+            "secret",
+            " secret ",
+            "Bearer secret",
+            "bearer secret",
+            "BEARER  secret",
+        ] {
             assert_eq!(
                 authorization_header(Some(key))
                     .and_then(|header| header.to_str().ok().map(str::to_owned))
@@ -1010,6 +1075,172 @@ mod tests {
         let response = client.poll_job("job-poll", Duration::ZERO).await?;
 
         assert!(response.skin.is_some());
+        server.verify().await;
+        Ok(())
+    }
+
+    fn cache_test_client(server_uri: &str) -> Result<MineSkinClient, Box<dyn Error + Send + Sync>> {
+        let config = AppConfig::for_tests(Url::parse(&format!("{server_uri}/v2/"))?);
+        Ok(MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?)
+    }
+
+    #[tokio::test]
+    async fn repeats_a_cached_cape_failure_with_the_original_message() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/capes"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = cache_test_client(&server.uri())?;
+
+        let first = client
+            .supported_capes()
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        let cached = client
+            .supported_capes()
+            .await
+            .err()
+            .ok_or("expected an error")?;
+
+        assert_eq!(cached.to_string(), first.to_string());
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keeps_the_upstream_url_out_of_cached_transport_failures() -> TestResult {
+        // Nothing listens on the port after the listener is dropped.
+        let address = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .to_string();
+        let client = cache_test_client(&format!("http://{address}"))?;
+
+        let first = client
+            .supported_capes()
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        let cached = client
+            .supported_capes()
+            .await
+            .err()
+            .ok_or("expected an error")?;
+
+        assert!(matches!(first, MineSkinClientError::Request(_)));
+        assert_eq!(cached.to_string(), "MineSkin request failed");
+        assert!(!cached.to_string().contains(&address));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shares_one_grant_request_between_concurrent_callers() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "success": true, "grants": { "capes": true } }))
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = cache_test_client(&server.uri())?;
+
+        let results = futures_util::future::join_all((0..5).map(|_| client.has_cape_grant())).await;
+
+        for result in results {
+            assert!(result?);
+        }
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serves_the_last_grant_while_a_refresh_fails() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "success": true, "grants": { "capes": true } })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/me"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "success": false,
+                "errors": [{ "message": "rate limited" }]
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+        config.cape_cache_ttl = Duration::ZERO;
+        let client = MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?;
+
+        // The first call caches the grant. The expired cache then fails to
+        // refresh, and the next calls get the last grant without another
+        // request until the retry delay passes.
+        for _ in 0..3 {
+            assert!(
+                client.has_cape_grant().await?,
+                "the last grant should be served"
+            );
+        }
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shares_a_grant_failure_until_the_retry_delay_passes() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/me"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({
+                        "success": false,
+                        "errors": [{ "message": "maintenance" }]
+                    }))
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = cache_test_client(&server.uri())?;
+
+        let mut results =
+            futures_util::future::join_all((0..5).map(|_| client.has_cape_grant())).await;
+        // Within the retry delay, later callers get the cached failure too.
+        results.push(client.has_cape_grant().await);
+
+        for result in results {
+            assert!(matches!(
+                result,
+                Err(MineSkinClientError::Upstream {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ref message
+                }) if message == "maintenance"
+            ));
+        }
         server.verify().await;
         Ok(())
     }
