@@ -91,12 +91,12 @@ pub struct DecryptedUrlResponse {
     responses(
         (status = 200, description = "MineSkin job completed successfully.", body = SanitizedResponse),
         (status = 400, description = "Invalid request payload.", body = ErrorResponse),
-        (status = 408, description = "The upload request exceeded its execution deadline.", body = ErrorResponse),
+        (status = 408, description = "The upload body was not received in time.", body = ErrorResponse),
         (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse),
         (status = 503, description = "The upload concurrency limit has been reached.", body = ErrorResponse),
-        (status = 504, description = "Timed out waiting for MineSkin to finish processing.", body = ErrorResponse)
+        (status = 504, description = "Timed out waiting for MineSkin, or the upload exceeded its execution deadline.", body = ErrorResponse)
     )
 )]
 pub async fn upload_skin(

@@ -192,7 +192,7 @@ async fn guard_upload(
 
     match timeout(state.upload_request_timeout, next.run(request)).await {
         Ok(response) => response,
-        Err(_) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "Skin upload request timed out")
+        Err(_) => ApiError::new(StatusCode::GATEWAY_TIMEOUT, "Skin upload request timed out")
             .into_response(),
     }
 }
