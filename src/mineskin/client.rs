@@ -17,7 +17,7 @@ use tokio::{
     sync::{Mutex, RwLock},
     time::{sleep, timeout},
 };
-use tracing::{error, warn};
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
@@ -37,6 +37,8 @@ const MINESKIN_USER_AGENT: &str = "Axolotl-MineSkin-Proxy/1.0";
 const MAXIMUM_UPSTREAM_RESPONSE_SIZE: usize = 1024 * 1024;
 const FAILURE_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAXIMUM_POLL_RETRY_DELAY: Duration = Duration::from_secs(10);
+const MAXIMUM_UNEXPECTED_POLL_RESPONSES: u32 = 3;
+const COMPLETED_WITHOUT_SKIN_MESSAGE: &str = "MineSkin job completed but no skin data provided";
 
 pub struct MineSkinClient {
     http: Client,
@@ -48,6 +50,7 @@ pub struct MineSkinClient {
     grant_cache: Mutex<GrantCacheState>,
     default_poll_interval: Duration,
     max_poll_duration: Duration,
+    minimum_poll_interval: Duration,
     cape_cache_ttl: Duration,
 }
 
@@ -72,6 +75,7 @@ impl MineSkinClient {
             grant_cache: Mutex::default(),
             default_poll_interval: config.default_poll_interval,
             max_poll_duration: config.max_poll_duration,
+            minimum_poll_interval: config.minimum_poll_interval,
             cape_cache_ttl: config.cape_cache_ttl,
         })
     }
@@ -85,10 +89,21 @@ impl MineSkinClient {
     /// does not look like a pending one.
     pub async fn fetch_job(&self, job_id: &str) -> Result<JobSuccessResponse, MineSkinClientError> {
         let (response, errors) = self.fetch_job_with_errors(job_id).await?;
-        if response.job.status == JobStatus::Failed {
-            return Err(failed_job_error(errors));
+        match response.job.status {
+            JobStatus::Failed => Err(failed_job_error(errors)),
+            // Without a skin a completed job would look pending forever.
+            JobStatus::Completed if response.skin_uuid().is_none() => {
+                Err(MineSkinClientError::upstream(
+                    StatusCode::BAD_GATEWAY,
+                    COMPLETED_WITHOUT_SKIN_MESSAGE,
+                ))
+            }
+            JobStatus::Completed
+            | JobStatus::Waiting
+            | JobStatus::Active
+            | JobStatus::Processing
+            | JobStatus::Unknown => Ok(response),
         }
-        Ok(response)
     }
 
     /// Fetches a job and keeps the upstream `errors` list, which `MineSkin`
@@ -122,16 +137,37 @@ impl MineSkinClient {
         job_id: &str,
         poll_interval: Duration,
     ) -> Result<SanitizedResponse, MineSkinClientError> {
+        // MineSkin rate limits job lookups and asks for at most one per second.
+        // Shorter waitMs values stay valid for compatibility but poll at the floor.
+        let poll_interval = poll_interval.max(self.minimum_poll_interval);
         let poll = async {
             let mut warned_unknown_status = false;
             let mut retry_delay = poll_interval;
+            let mut unexpected_responses = 0_u32;
             loop {
                 // The job is already queued, so a transient failure must not
                 // abort the upload. Retrying the upload would queue a duplicate.
                 let (response, errors) = match self.fetch_job_with_errors(job_id).await {
                     Ok(result) => result,
+                    // An unreadable response may be a passing glitch, but one
+                    // that keeps coming back will not fix itself, so give up
+                    // with its reason instead of waiting for the deadline.
+                    Err(error @ MineSkinClientError::UnexpectedResponse { .. })
+                        if unexpected_responses.saturating_add(1)
+                            >= MAXIMUM_UNEXPECTED_POLL_RESPONSES =>
+                    {
+                        return Err(error);
+                    }
                     Err(error) if error.is_transient() => {
-                        warn!(%error, job_id, "Retrying MineSkin job status after a transient error");
+                        if matches!(error, MineSkinClientError::UnexpectedResponse { .. }) {
+                            unexpected_responses = unexpected_responses.saturating_add(1);
+                        }
+                        // Log the source chain: reqwest's own text omits the
+                        // cause, such as a timeout or a refused connection.
+                        warn!(
+                            error = &error as &dyn std::error::Error,
+                            job_id, "Retrying MineSkin job status after a transient error"
+                        );
                         // Back off so a rate-limited or failing MineSkin is not polled
                         // at the client's chosen interval.
                         sleep(retry_delay).await;
@@ -144,13 +180,14 @@ impl MineSkinClient {
                     Err(error) => return Err(error),
                 };
                 retry_delay = poll_interval;
+                unexpected_responses = 0;
 
                 match response.job.status {
                     JobStatus::Completed => {
                         if response.skin_uuid().is_none() {
                             return Err(MineSkinClientError::upstream(
                                 StatusCode::BAD_GATEWAY,
-                                "MineSkin job completed but no skin data provided",
+                                COMPLETED_WITHOUT_SKIN_MESSAGE,
                             ));
                         }
                         return self.sanitize_job(response);
@@ -205,7 +242,14 @@ impl MineSkinClient {
             MineSkinClientError::InvalidUpload("Skin file is too large".to_owned())
         })?;
         let mut file = Part::stream_with_length(upload.file, file_length)
-            .file_name(upload.file_name.unwrap_or_else(|| "skin.png".to_owned()));
+            // A multipart parser such as busboy reads a part with an empty
+            // file name as a text field, so MineSkin would see no file.
+            .file_name(
+                upload
+                    .file_name
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "skin.png".to_owned()),
+            );
         if let Some(content_type) = upload.content_type {
             file = file.mime_str(&content_type).map_err(|error| {
                 tracing::debug!(%error, "Invalid skin file content type");
@@ -281,7 +325,10 @@ impl MineSkinClient {
                 drop(refresh);
 
                 if let Some(cached) = cached {
-                    warn!(%error, "Failed to refresh MineSkin capes; serving stale data");
+                    warn!(
+                        error = &error as &dyn std::error::Error,
+                        "Failed to refresh MineSkin capes; serving stale data"
+                    );
                     Ok(Arc::clone(&cached.data))
                 } else {
                     Err(error)
@@ -342,7 +389,10 @@ impl MineSkinClient {
             Err(error) => {
                 cache.last_failure = Some(CachedFailure::new(&error));
                 if let Some(has_grant) = stale {
-                    warn!(%error, "Failed to refresh the MineSkin cape grant; serving stale data");
+                    warn!(
+                        error = &error as &dyn std::error::Error,
+                        "Failed to refresh the MineSkin cape grant; serving stale data"
+                    );
                     Ok(has_grant)
                 } else {
                     Err(error)
@@ -438,7 +488,11 @@ impl MineSkinClient {
         request: RequestBuilder,
         context: &'static str,
     ) -> Result<MineSkinResponse, MineSkinClientError> {
-        let started_at = Instant::now();
+        let mut record = CallRecord {
+            metrics: &self.metrics,
+            started_at: Instant::now(),
+            outcome: None,
+        };
         let result = async {
             let response = request.send().await.map_err(MineSkinClientError::Request)?;
             let status = response.status();
@@ -486,8 +540,7 @@ impl MineSkinClient {
             .err()
             .and_then(MineSkinClientError::upstream_status)
             == Some(StatusCode::TOO_MANY_REQUESTS);
-        self.metrics
-            .finish_mineskin_request(started_at.elapsed(), result.is_err(), rate_limited);
+        record.outcome = Some((result.is_err(), rate_limited));
         result
     }
 }
@@ -596,7 +649,7 @@ fn parse_response(
     response: &BufferedResponse,
 ) -> Result<MineSkinResponse, MineSkinClientError> {
     serde_json::from_slice(&response.body).map_err(|source| {
-        error!(
+        warn!(
             context,
             status = %response.status,
             response_size = response.body.len(),
@@ -628,6 +681,23 @@ fn parse_error_response(context: &'static str, response: &BufferedResponse) -> M
                 format!("MineSkin request failed with status {}", response.status),
             )
         }
+    }
+}
+
+/// Records a `MineSkin` call when dropped. A call cancelled by a deadline or a
+/// client disconnect never reaches its outcome, so it counts as a failure.
+struct CallRecord<'a> {
+    metrics: &'a Metrics,
+    started_at: Instant,
+    /// Whether the call failed and whether it was rate limited.
+    outcome: Option<(bool, bool)>,
+}
+
+impl Drop for CallRecord<'_> {
+    fn drop(&mut self) {
+        let (failed, rate_limited) = self.outcome.unwrap_or((true, false));
+        self.metrics
+            .finish_mineskin_request(self.started_at.elapsed(), failed, rate_limited);
     }
 }
 
@@ -757,7 +827,7 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{body_string_contains, method, path},
     };
 
     use super::*;
@@ -1278,6 +1348,206 @@ mod tests {
             ));
         }
         server.verify().await;
+        Ok(())
+    }
+
+    thread_local! {
+        static THREAD_LOGS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Writes log lines into a buffer of the thread that emits them.
+    struct ThreadLogWriter;
+
+    impl std::io::Write for ThreadLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            THREAD_LOGS.with_borrow_mut(|logs| logs.extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Captures the log lines of the current thread. A global subscriber is
+    /// used because a scoped one races with tests on other threads that
+    /// register the same callsites, which can disable them.
+    fn capture_thread_logs() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(|| ThreadLogWriter)
+                .finish();
+            // Ignore the error: another subscriber means the logs stay empty
+            // and the test fails with a clear message.
+            drop(tracing::subscriber::set_global_default(subscriber));
+        });
+        THREAD_LOGS.with_borrow_mut(Vec::clear);
+    }
+
+    fn thread_logs() -> String {
+        THREAD_LOGS.with_borrow(|logs| String::from_utf8_lossy(logs).into_owned())
+    }
+
+    #[tokio::test]
+    async fn logs_why_a_job_status_request_failed_before_retrying() -> TestResult {
+        capture_thread_logs();
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+        )
+        .await;
+        mount_job_response(&server, 2, completed_job()).await;
+        let mut config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+        config.request_timeout = Duration::from_millis(100);
+        let client = MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?;
+
+        client.poll_job("job-poll", Duration::ZERO).await?;
+
+        let logs = thread_logs();
+        let line = logs
+            .lines()
+            .find(|line| line.contains("Retrying MineSkin job status"))
+            .ok_or_else(|| format!("expected a retry log line in: {logs}"))?;
+        assert!(
+            line.contains("error.sources=") && line.contains("operation timed out"),
+            "the retry log should name the cause: {line}"
+        );
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sends_a_default_file_name_for_an_empty_one() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/queue"))
+            .and(body_string_contains("filename=\"skin.png\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "job": { "id": "job-1", "status": "waiting" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = cache_test_client(&server.uri())?;
+
+        let job = client
+            .enqueue(UploadPayload {
+                file: Bytes::from_static(b"png-bytes"),
+                file_name: Some(String::new()),
+                content_type: Some("image/png".to_owned()),
+                variant: "classic".to_owned(),
+                name: None,
+                cape_uuid: CAPE_UUID.to_owned(),
+            })
+            .await?;
+
+        assert_eq!(job.id, "job-1");
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_repeated_unreadable_job_responses() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/queue/job-poll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "success": true })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let client = poll_test_client(&server, Duration::from_secs(30))?;
+
+        let started = Instant::now();
+        let error = client
+            .poll_job("job-poll", Duration::from_millis(1))
+            .await
+            .expect_err("a response that never parses should fail the poll");
+
+        assert!(
+            matches!(
+                error,
+                MineSkinClientError::UnexpectedResponse { ref message, .. } if message == "job is missing"
+            ),
+            "the poll should return the real reason: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the poll should not wait for its deadline"
+        );
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn polls_no_faster_than_the_minimum_interval() -> TestResult {
+        let server = MockServer::start().await;
+        mount_job_response(
+            &server,
+            1,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "job": { "id": "job-poll", "status": "waiting" }
+            })),
+        )
+        .await;
+        mount_job_response(&server, 2, completed_job()).await;
+        let mut config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+        config.minimum_poll_interval = Duration::from_millis(200);
+        let client = MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::new(Metrics::default()),
+        )?;
+
+        let started = Instant::now();
+        client
+            .poll_job("job-poll", Duration::from_millis(1))
+            .await?;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "a 1 ms waitMs must still wait the minimum interval between polls"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn counts_a_mineskin_call_cancelled_by_a_deadline() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/queue/job-slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let metrics = Arc::new(Metrics::default());
+        let config = AppConfig::for_tests(Url::parse(&format!("{}/v2/", server.uri()))?);
+        let client = MineSkinClient::new(
+            &config,
+            UrlCipher::new(config.aes_secret_key.as_deref()),
+            Arc::clone(&metrics),
+        )?;
+
+        let result = timeout(Duration::from_millis(100), client.fetch_job("job-slow")).await;
+
+        result.expect_err("the call should be cut off by the deadline");
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.mineskin_requests, 1,
+            "the cancelled call is counted"
+        );
+        assert_eq!(
+            snapshot.mineskin_errors, 1,
+            "the cancelled call counts as failed"
+        );
         Ok(())
     }
 }
