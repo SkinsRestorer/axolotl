@@ -242,8 +242,8 @@ fn traffic_stats(snapshot: &MetricsSnapshot) -> String {
         format_number(snapshot.client_errors),
         format_number(snapshot.server_errors),
         format_latency(snapshot.request_latency.average()),
-        format_latency(snapshot.request_latency.percentile(50)),
-        format_latency(snapshot.request_latency.percentile(95))
+        format_percentile_latency(snapshot.request_latency.percentile(50)),
+        format_percentile_latency(snapshot.request_latency.percentile(95))
     )
 }
 
@@ -260,8 +260,8 @@ fn format_endpoint_stats(snapshot: &EndpointSnapshot) -> String {
         format_number(snapshot.client_errors),
         format_number(snapshot.server_errors),
         format_latency(snapshot.latency.average()),
-        format_latency(snapshot.latency.percentile(50)),
-        format_latency(snapshot.latency.percentile(95)),
+        format_percentile_latency(snapshot.latency.percentile(50)),
+        format_percentile_latency(snapshot.latency.percentile(95)),
         client_insight.pattern,
         format_number(client_insight.unique_clients),
         format_number(client_insight.attributed_requests),
@@ -312,8 +312,8 @@ fn mineskin_stats(snapshot: &MetricsSnapshot) -> String {
         format_number(snapshot.mineskin_rate_limits),
         format_bytes(snapshot.bytes_received_from_mineskin),
         format_latency(snapshot.mineskin_latency.average()),
-        format_latency(snapshot.mineskin_latency.percentile(50)),
-        format_latency(snapshot.mineskin_latency.percentile(95))
+        format_percentile_latency(snapshot.mineskin_latency.percentile(50)),
+        format_percentile_latency(snapshot.mineskin_latency.percentile(95))
     )
 }
 
@@ -408,10 +408,15 @@ fn percentage(part: u64, total: u64) -> f64 {
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
-    match bytes {
-        0..=1023 => format!("{bytes} B"),
-        1024..=1_048_575 => format!("{:.2} KiB", bytes as f64 / KIB),
-        _ => format!("{:.2} MiB", bytes as f64 / MIB),
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kibibytes = format!("{:.2}", bytes as f64 / KIB);
+    // Sizes just under 1 MiB round up to "1024.00", so show those in MiB.
+    if kibibytes == "1024.00" || bytes >= 1_048_576 {
+        format!("{:.2} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{kibibytes} KiB")
     }
 }
 
@@ -436,7 +441,9 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_report_period(duration: Duration) -> String {
-    let minutes = duration.as_secs().div_ceil(60);
+    // Ticks fire slightly after the interval, so round to the nearest minute
+    // instead of up, and never label a short window as "0min".
+    let minutes = (duration.as_secs().saturating_add(30) / 60).max(1);
     format!("{minutes}min")
 }
 
@@ -465,6 +472,15 @@ fn format_latency(duration: Duration) -> String {
     }
 
     format!("{:.2} s", duration.as_secs_f64())
+}
+
+/// Percentiles come from histogram buckets, and the last bucket has no upper
+/// bound, so anything above its 60 s lower bound only means "more than 60 s".
+fn format_percentile_latency(duration: Duration) -> String {
+    if duration > Duration::from_mins(1) {
+        return ">60 s".to_owned();
+    }
+    format_latency(duration)
 }
 
 async fn process_rss_bytes() -> Option<u64> {
@@ -500,8 +516,41 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::{
-        ClientInsight, Metrics, MetricsSnapshot, build_report, format_latency, run, send_report,
+        ClientInsight, Metrics, MetricsSnapshot, build_report, format_bytes, format_latency,
+        format_percentile_latency, format_report_period, run, send_report,
     };
+
+    #[test]
+    fn shows_the_open_ended_latency_bucket_as_more_than_a_minute() {
+        let metrics = Metrics::default();
+        metrics.finish_mineskin_request(Duration::from_secs(90), false, false);
+        let percentile = metrics.snapshot().mineskin_latency.percentile(95);
+
+        assert_eq!(format_percentile_latency(percentile), ">60 s");
+        assert_eq!(format_percentile_latency(Duration::from_mins(1)), "60.00 s");
+        assert_eq!(
+            format_percentile_latency(Duration::from_millis(250)),
+            "250 ms"
+        );
+    }
+
+    #[test]
+    fn shows_sizes_that_round_to_1024_kib_in_mib() {
+        assert_eq!(format_bytes(1_023), "1023 B");
+        assert_eq!(format_bytes(1_024), "1.00 KiB");
+        assert_eq!(format_bytes(1_048_570), "1023.99 KiB");
+        assert_eq!(format_bytes(1_048_571), "1.00 MiB");
+        assert_eq!(format_bytes(1_048_575), "1.00 MiB");
+        assert_eq!(format_bytes(1_048_576), "1.00 MiB");
+    }
+
+    #[test]
+    fn labels_a_slightly_late_report_with_its_nominal_period() {
+        assert_eq!(format_report_period(Duration::from_secs(301)), "5min");
+        assert_eq!(format_report_period(Duration::from_millis(300_004)), "5min");
+        assert_eq!(format_report_period(Duration::from_secs(599)), "10min");
+        assert_eq!(format_report_period(Duration::from_secs(10)), "1min");
+    }
 
     #[test]
     fn shows_sub_millisecond_latency_as_nonzero() {
