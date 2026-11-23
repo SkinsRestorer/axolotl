@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub(crate) request_timeout: Duration,
     pub(crate) default_poll_interval: Duration,
     pub(crate) max_poll_duration: Duration,
+    /// `MineSkin` asks clients to poll a job at most once per second.
+    pub(crate) minimum_poll_interval: Duration,
     pub(crate) cape_cache_ttl: Duration,
     pub(crate) max_concurrent_uploads: usize,
 }
@@ -34,10 +36,7 @@ impl AppConfig {
     /// `PORT` is not a valid TCP port, when an application URL cannot be
     /// parsed, or when `DISCORD_WEBHOOK` does not use HTTPS.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let port = match optional_environment_value("PORT")? {
-            Some(value) => parse_port(&value)?,
-            None => DEFAULT_PORT,
-        };
+        let port = parse_port(optional_environment_value("PORT")?)?;
 
         Ok(Self {
             port,
@@ -49,6 +48,7 @@ impl AppConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             default_poll_interval: DEFAULT_POLL_INTERVAL,
             max_poll_duration: DEFAULT_MAX_POLL_DURATION,
+            minimum_poll_interval: DEFAULT_POLL_INTERVAL,
             cape_cache_ttl: DEFAULT_CAPE_CACHE_TTL,
             max_concurrent_uploads: DEFAULT_MAX_CONCURRENT_UPLOADS,
         })
@@ -62,6 +62,18 @@ impl AppConfig {
     #[must_use]
     pub const fn discord_webhook(&self) -> Option<&Url> {
         self.discord_webhook.as_ref()
+    }
+
+    /// Reports whether `MINESKIN_API_KEY` has a value, without exposing it.
+    #[must_use]
+    pub fn has_mineskin_api_key(&self) -> bool {
+        !is_blank(self.mineskin_api_key.as_deref())
+    }
+
+    /// Reports whether `AES_SECRET_KEY` has a value, without exposing it.
+    #[must_use]
+    pub fn has_aes_secret_key(&self) -> bool {
+        !is_blank(self.aes_secret_key.as_deref())
     }
 
     /// Describes configuration problems that do not stop startup but make some
@@ -103,6 +115,7 @@ impl AppConfig {
             request_timeout: Duration::from_secs(2),
             default_poll_interval: Duration::from_millis(1),
             max_poll_duration: Duration::from_secs(1),
+            minimum_poll_interval: Duration::ZERO,
             cape_cache_ttl: DEFAULT_CAPE_CACHE_TTL,
             max_concurrent_uploads: 1,
         }
@@ -141,16 +154,20 @@ fn parse_discord_webhook(value: Option<String>) -> Result<Option<Url>, ConfigErr
     Ok(Some(url))
 }
 
-fn parse_port(value: &str) -> Result<u16, ConfigError> {
-    value.parse().map_err(|source| ConfigError::InvalidPort {
-        value: value.to_owned(),
-        source,
-    })
+/// Treats a blank value as unset, matching the other optional variables.
+fn parse_port(value: Option<String>) -> Result<u16, ConfigError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(DEFAULT_PORT);
+    };
+    value
+        .trim()
+        .parse()
+        .map_err(|source| ConfigError::InvalidPort { value, source })
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("PORT must be a valid TCP port, received {value:?}")]
+    #[error("PORT must be a TCP port number from 0 to 65535, received {value:?}")]
     InvalidPort {
         value: String,
         #[source]
@@ -170,7 +187,10 @@ pub enum ConfigError {
 mod tests {
     use url::Url;
 
-    use super::{AppConfig, ConfigError, parse_discord_webhook, read_environment_value};
+    use super::{
+        AppConfig, ConfigError, DEFAULT_PORT, parse_discord_webhook, parse_port,
+        read_environment_value,
+    };
 
     fn config_with_secrets(api_key: Option<&str>, aes_secret: Option<&str>) -> AppConfig {
         let base_url = Url::parse("https://example.com/").expect("the test URL is valid");
@@ -231,6 +251,46 @@ mod tests {
                 .startup_warnings()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reports_which_secrets_are_set() {
+        for (api_key, aes_secret, expected) in [
+            (Some("key"), Some("secret"), (true, true)),
+            (None, Some("secret"), (false, true)),
+            (Some(" "), None, (false, false)),
+            (Some("key"), Some("\n"), (true, false)),
+        ] {
+            let config = config_with_secrets(api_key, aes_secret);
+            assert_eq!(
+                (config.has_mineskin_api_key(), config.has_aes_secret_key()),
+                expected,
+                "unexpected result for {api_key:?} and {aes_secret:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uses_the_default_port_when_port_is_blank() {
+        for value in [None, Some(String::new()), Some(" \n".to_owned())] {
+            assert!(
+                matches!(parse_port(value.clone()), Ok(DEFAULT_PORT)),
+                "{value:?} should use the default port"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_padded_ports_and_rejects_invalid_ones() {
+        assert!(matches!(parse_port(Some(" 8080\n".to_owned())), Ok(8080)));
+
+        for value in ["abc", "-1", "65536"] {
+            let error = parse_port(Some(value.to_owned())).expect_err("the port is invalid");
+            assert_eq!(
+                error.to_string(),
+                format!("PORT must be a TCP port number from 0 to 65535, received {value:?}")
+            );
+        }
     }
 
     #[test]
