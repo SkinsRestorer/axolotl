@@ -227,6 +227,10 @@ fn acknowledge_clients(
         }
     }
     requests.retain(|_, count| *count > 0);
+    // `retain` keeps the allocation, and cloning a map copies its full
+    // capacity. Without this, one burst of clients would make every later
+    // snapshot copy megabytes of empty buckets.
+    requests.shrink_to_fit();
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -577,6 +581,34 @@ mod tests {
             after_acknowledgement.decrypt.client_requests.get(&client),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn releases_client_table_memory_after_acknowledging_a_burst() {
+        let metrics = Metrics::default();
+        for index in 0_u32..10_000 {
+            metrics.record_request(
+                "/mineskin/skins",
+                200,
+                Some(IpAddr::from(index.to_be_bytes())),
+                Duration::from_millis(5),
+            );
+        }
+        let reported = metrics.snapshot();
+        metrics.acknowledge_client_requests(&reported);
+
+        let client = IpAddr::from_str("192.0.2.10").expect("test IP should be valid");
+        metrics.record_request(
+            "/mineskin/skins",
+            200,
+            Some(client),
+            Duration::from_millis(5),
+        );
+        let next = metrics.snapshot();
+        assert_eq!(next.client_requests.len(), 1);
+        assert!(next.client_requests.capacity() < 100);
+        assert!(next.upload.client_requests.capacity() < 100);
+        assert!(next.decrypt.client_requests.capacity() < 100);
     }
 
     #[test]
