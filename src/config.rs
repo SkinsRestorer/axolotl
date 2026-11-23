@@ -34,10 +34,9 @@ impl AppConfig {
     /// `PORT` is not a valid TCP port, when an application URL cannot be
     /// parsed, or when `DISCORD_WEBHOOK` does not use HTTPS.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let port = match env::var("PORT") {
-            Ok(value) => parse_port(&value)?,
-            Err(env::VarError::NotPresent) => DEFAULT_PORT,
-            Err(error) => return Err(ConfigError::Environment(error)),
+        let port = match optional_environment_value("PORT")? {
+            Some(value) => parse_port(&value)?,
+            None => DEFAULT_PORT,
         };
 
         Ok(Self {
@@ -70,8 +69,15 @@ impl AppConfig {
     #[must_use]
     pub fn startup_warnings(&self) -> Vec<&'static str> {
         let mut warnings = Vec::new();
-        if is_blank(self.mineskin_api_key.as_deref()) {
-            warnings.push("MINESKIN_API_KEY is not set, so MineSkin requests will fail");
+        match self.mineskin_api_key.as_deref() {
+            key if is_blank(key) => {
+                warnings.push("MINESKIN_API_KEY is not set, so MineSkin requests will fail");
+            }
+            // Use the client's own check so the warning and the requests agree.
+            key if crate::mineskin::authorization_header(key).is_none() => warnings.push(
+                "MINESKIN_API_KEY is not a usable bearer token, so MineSkin requests will fail",
+            ),
+            _ => {}
         }
         match self.aes_secret_key.as_deref() {
             secret if is_blank(secret) => {
@@ -104,10 +110,18 @@ impl AppConfig {
 }
 
 fn optional_environment_value(name: &'static str) -> Result<Option<String>, ConfigError> {
-    match env::var(name) {
+    read_environment_value(name, env::var(name))
+}
+
+fn read_environment_value(
+    name: &'static str,
+    value: Result<String, env::VarError>,
+) -> Result<Option<String>, ConfigError> {
+    match value {
         Ok(value) => Ok(Some(value)),
         Err(env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(ConfigError::Environment(error)),
+        // The error would carry the raw value, which can be a secret.
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError::NotUnicode { name }),
     }
 }
 
@@ -142,8 +156,8 @@ pub enum ConfigError {
         #[source]
         source: ParseIntError,
     },
-    #[error("failed to read an environment variable")]
-    Environment(#[source] env::VarError),
+    #[error("{name} must be valid Unicode")]
+    NotUnicode { name: &'static str },
     #[error("the configured MineSkin base URL is invalid")]
     InvalidBaseUrl(#[source] url::ParseError),
     #[error("DISCORD_WEBHOOK must be a valid URL")]
@@ -156,7 +170,7 @@ pub enum ConfigError {
 mod tests {
     use url::Url;
 
-    use super::{AppConfig, ConfigError, parse_discord_webhook};
+    use super::{AppConfig, ConfigError, parse_discord_webhook, read_environment_value};
 
     fn config_with_secrets(api_key: Option<&str>, aes_secret: Option<&str>) -> AppConfig {
         let base_url = Url::parse("https://example.com/").expect("the test URL is valid");
@@ -177,6 +191,26 @@ mod tests {
                     "AES_SECRET_KEY is not set, so URL encryption will fail",
                 ],
                 "unexpected warnings for {api_key:?} and {aes_secret:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warns_about_api_keys_the_client_cannot_send() {
+        for api_key in ["Bearer", " bearer \n", "bad\nkey", "bad\u{7f}key"] {
+            let warnings = config_with_secrets(Some(api_key), Some("secret")).startup_warnings();
+            assert_eq!(
+                warnings,
+                ["MINESKIN_API_KEY is not a usable bearer token, so MineSkin requests will fail"],
+                "unexpected warnings for {api_key:?}"
+            );
+        }
+        for api_key in [" key\n", "Bearer key", "tab\tkey"] {
+            assert!(
+                config_with_secrets(Some(api_key), Some("secret"))
+                    .startup_warnings()
+                    .is_empty(),
+                "{api_key:?} should be usable"
             );
         }
     }
@@ -230,6 +264,21 @@ mod tests {
         assert!(
             matches!(invalid, Err(ConfigError::InvalidDiscordWebhook(_))),
             "an unparsable webhook should be rejected: {invalid:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_non_unicode_variables_by_name_without_the_value() {
+        use std::{env::VarError, ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let value = OsString::from_vec(b"hunter2\xff".to_vec());
+        let error = read_environment_value("AES_SECRET_KEY", Err(VarError::NotUnicode(value)))
+            .expect_err("a non-Unicode value should be rejected");
+        assert_eq!(error.to_string(), "AES_SECRET_KEY must be valid Unicode");
+        assert!(
+            !format!("{error:?}").contains("hunter2"),
+            "the error must not expose the value: {error:?}"
         );
     }
 }
