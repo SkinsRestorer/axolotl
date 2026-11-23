@@ -53,7 +53,10 @@ async fn serves_health_and_json_not_found_responses() -> TestResult {
 
     let missing = get(&app, "/does-not-exist").await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    assert_eq!(json_body(missing).await?, json!({ "error": "Not Found" }));
+    assert_eq!(
+        json_body(missing).await?,
+        json!({ "error": "Not Found", "code": "not_found" })
+    );
     Ok(())
 }
 
@@ -132,7 +135,7 @@ async fn maps_mineskin_job_not_found_to_the_public_contract() -> TestResult {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Job not found" })
+        json!({ "error": "Job not found", "code": "job_not_found" })
     );
     Ok(())
 }
@@ -155,7 +158,7 @@ async fn preserves_upstream_status_for_non_json_error_pages() -> TestResult {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "MineSkin request failed with status 429 Too Many Requests" })
+        json!({ "error": "MineSkin request failed with status 429 Too Many Requests", "code": "mineskin_rate_limited" })
     );
     Ok(())
 }
@@ -187,7 +190,8 @@ async fn reports_jobs_with_unknown_upstream_statuses_as_pending() -> TestResult 
             "success": true,
             "skin": null,
             "warnings": [],
-            "messages": []
+            "messages": [],
+            "job": { "id": "job-new", "status": "unknown" }
         })
     );
     server.verify().await;
@@ -236,7 +240,7 @@ async fn deduplicates_concurrent_failed_cape_refreshes() -> TestResult {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": "temporary failure" })
+            json!({ "error": "temporary failure", "code": "mineskin_error" })
         );
     }
     server.verify().await;
@@ -262,7 +266,7 @@ async fn rejects_oversized_upstream_responses() -> TestResult {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Unexpected MineSkin cape response: response exceeded 1 MiB" })
+        json!({ "error": "Unexpected MineSkin cape response: response exceeded 1 MiB", "code": "mineskin_error" })
     );
     server.verify().await;
     Ok(())
@@ -299,7 +303,7 @@ async fn rejects_oversized_chunked_upstream_responses_while_streaming() -> TestR
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Unexpected MineSkin cape response: response exceeded 1 MiB" })
+        json!({ "error": "Unexpected MineSkin cape response: response exceeded 1 MiB", "code": "mineskin_error" })
     );
     server.verify().await;
     Ok(())
@@ -329,7 +333,7 @@ async fn rejects_non_https_cape_urls() -> TestResult {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Unexpected MineSkin cape response: cape URL must use HTTPS" })
+        json!({ "error": "Unexpected MineSkin cape response: cape URL must use HTTPS", "code": "mineskin_error" })
     );
     server.verify().await;
     Ok(())
@@ -409,7 +413,7 @@ async fn reports_cape_support_upstream_failures_as_json() -> TestResult {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "invalid api key" })
+        json!({ "error": "invalid api key", "code": "mineskin_error" })
     );
     server.verify().await;
     Ok(())
@@ -440,7 +444,7 @@ async fn repeats_a_rate_limited_cape_grant_lookup_without_asking_mineskin_again(
         );
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": "rate limit exceeded" }),
+            json!({ "error": "rate limit exceeded", "code": "mineskin_rate_limited" }),
             "attempt {attempt}"
         );
     }
@@ -476,7 +480,7 @@ async fn fails_cape_support_when_a_granted_account_cannot_list_capes() -> TestRe
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "rate limit exceeded" })
+        json!({ "error": "rate limit exceeded", "code": "mineskin_rate_limited" })
     );
     server.verify().await;
     Ok(())
@@ -509,7 +513,7 @@ async fn rejects_invalid_decrypt_url_requests_with_json_errors() -> TestResult {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "query {query}");
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": expected_error }),
+            json!({ "error": expected_error, "code": "invalid_encrypted_url" }),
             "query {query}"
         );
     }
@@ -600,11 +604,16 @@ async fn rejects_invalid_uploads_before_calling_mineskin() -> TestResult {
         ),
     ] {
         let response = post_multipart(&app, uri, body).await?;
+        let expected_code = if uri.contains("waitMs=") {
+            "invalid_wait_ms"
+        } else {
+            "invalid_upload"
+        };
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": expected_error }),
+            json!({ "error": expected_error, "code": expected_code }),
             "{case}"
         );
     }
@@ -646,7 +655,7 @@ async fn preserves_upload_rate_limits_and_cors_headers() -> TestResult {
     );
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "rate limit exceeded (hour), 61 > 60" })
+        json!({ "error": "rate limit exceeded (hour), 61 > 60", "code": "mineskin_rate_limited" })
     );
     server.verify().await;
     Ok(())
@@ -678,9 +687,14 @@ async fn returns_400_only_when_mineskin_rejects_the_queued_skin() -> TestResult 
             expected_status,
             "upstream {upstream_status}"
         );
+        let expected_code = if expected_status == StatusCode::BAD_REQUEST {
+            "invalid_upload"
+        } else {
+            "mineskin_error"
+        };
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": "Skin image is invalid" }),
+            json!({ "error": "Skin image is invalid", "code": expected_code }),
             "upstream {upstream_status}"
         );
         assert_eq!(
@@ -771,7 +785,8 @@ async fn verify_encrypted_upload(completed: Value) -> TestResult {
             "success": true,
             "skin": { "url": encrypted_url },
             "warnings": [],
-            "messages": []
+            "messages": [],
+            "job": { "id": "job-1", "status": "completed" }
         }),
         "unexpected upload response for cape {CAPE_UUID}"
     );
@@ -850,7 +865,8 @@ async fn keeps_job_results_encrypted_and_ignores_pending_results() -> TestResult
                 "success": true,
                 "skin": expected_skin,
                 "warnings": [],
-                "messages": []
+                "messages": [],
+                "job": { "id": "job-result", "status": status }
             }),
             "status {status}"
         );
@@ -923,7 +939,7 @@ async fn backs_off_while_job_status_polls_keep_failing() -> TestResult {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Timed out waiting for MineSkin job to finish" })
+        json!({ "error": "Timed out waiting for MineSkin job to finish", "code": "job_timeout" })
     );
     let polls = upstream_requests(&server, Some("/v2/queue/job-1")).await;
     assert!(
@@ -960,7 +976,7 @@ async fn returns_504_when_an_uploaded_job_never_finishes() -> TestResult {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Timed out waiting for MineSkin job to finish" })
+        json!({ "error": "Timed out waiting for MineSkin job to finish", "code": "job_timeout" })
     );
     let polls = upstream_requests(&server, Some("/v2/queue/job-1")).await;
     assert!(polls >= 2, "the job was polled only {polls} times");
@@ -1025,7 +1041,7 @@ async fn fails_an_upload_without_retrying_when_mineskin_rejects_the_job() -> Tes
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": expected_error }),
+            json!({ "error": expected_error, "code": "mineskin_error" }),
             "{case}"
         );
         server.verify().await;
@@ -1055,7 +1071,7 @@ async fn rejects_uploads_with_an_unsupported_cape_before_queueing() -> TestResul
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Requested cape is not supported" })
+        json!({ "error": "Requested cape is not supported", "code": "unsupported_cape" })
     );
     server.verify().await;
     Ok(())
@@ -1092,7 +1108,7 @@ async fn rejects_uploads_above_the_concurrency_limit_until_a_slot_frees() -> Tes
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         json_body(second).await?,
-        json!({ "error": "Too many skin uploads are already in progress" })
+        json!({ "error": "Too many skin uploads are already in progress", "code": "upload_busy" })
     );
 
     first.abort();
@@ -1110,7 +1126,7 @@ async fn rejects_uploads_above_the_concurrency_limit_until_a_slot_frees() -> Tes
     );
     assert_eq!(
         json_body(third).await?,
-        json!({ "error": "capeUuid must be a valid UUID" })
+        json!({ "error": "capeUuid must be a valid UUID", "code": "invalid_upload" })
     );
     server.verify().await;
     Ok(())
@@ -1133,6 +1149,7 @@ fn openapi_document_exposes_the_complete_public_surface() -> TestResult {
         "/mineskin/decrypt-url",
         "/mineskin/jobs/{jobId}",
         "/mineskin/skins",
+        "/ready",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1441,7 +1458,7 @@ async fn returns_json_for_unsupported_methods_on_known_routes() -> TestResult {
         );
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": "Method Not Allowed" })
+            json!({ "error": "Method Not Allowed", "code": "method_not_allowed" })
         );
     }
     Ok(())
@@ -1475,7 +1492,7 @@ async fn rejects_invalid_job_ids_without_calling_mineskin() -> TestResult {
         );
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": "jobId must contain 1 to 64 letters, digits, hyphens, or underscores" }),
+            json!({ "error": "jobId must contain 1 to 64 letters, digits, hyphens, or underscores", "code": "invalid_job_id" }),
             "job ID {job_id}"
         );
     }
@@ -1495,7 +1512,7 @@ async fn rejects_upload_bodies_above_the_size_limit_with_a_documented_413() -> T
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Skin upload body exceeds the size limit" })
+        json!({ "error": "Skin upload body exceeds the size limit", "code": "payload_too_large" })
     );
     let document = serde_json::to_value(api_document(4242))?;
     assert!(
@@ -1519,7 +1536,7 @@ async fn hides_transport_error_details_from_clients() -> TestResult {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "MineSkin request failed" })
+        json!({ "error": "MineSkin request failed", "code": "mineskin_error" })
     );
     Ok(())
 }
@@ -1577,7 +1594,7 @@ async fn rejects_skin_files_above_5_mib_within_the_body_limit_with_413() -> Test
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Skin file must not exceed 5 MiB" })
+        json!({ "error": "Skin file must not exceed 5 MiB", "code": "payload_too_large" })
     );
     Ok(())
 }
@@ -1620,7 +1637,10 @@ async fn serves_the_swagger_ui_and_json_for_unknown_swagger_files() -> TestResul
 
     let missing = get(&app, "/swagger/nope").await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    assert_eq!(json_body(missing).await?, json!({ "error": "Not Found" }));
+    assert_eq!(
+        json_body(missing).await?,
+        json!({ "error": "Not Found", "code": "not_found" })
+    );
     Ok(())
 }
 
@@ -1643,7 +1663,7 @@ async fn reports_a_failed_job_on_the_job_status_route() -> TestResult {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Invalid skin image" })
+        json!({ "error": "Invalid skin image", "code": "mineskin_error" })
     );
     Ok(())
 }
@@ -1666,7 +1686,7 @@ async fn rejects_a_cape_response_without_a_cape_list() -> TestResult {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": "Unexpected MineSkin cape response: capes is missing" })
+            json!({ "error": "Unexpected MineSkin cape response: capes is missing", "code": "mineskin_error" })
         );
     }
     server.verify().await;
@@ -1712,7 +1732,7 @@ async fn rejects_upload_bodies_that_are_not_multipart_with_the_expected_content_
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Content-Type must be multipart/form-data with a boundary" })
+        json!({ "error": "Content-Type must be multipart/form-data with a boundary", "code": "invalid_upload" })
     );
     Ok(())
 }
@@ -1738,7 +1758,7 @@ async fn rejects_a_blank_skin_name_before_calling_mineskin() -> TestResult {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "name must not be blank" })
+        json!({ "error": "name must not be blank", "code": "invalid_upload" })
     );
     assert_eq!(server.received_requests().await.map(|r| r.len()), Some(0));
     Ok(())
@@ -1766,7 +1786,276 @@ async fn reports_a_completed_job_without_skin_data_on_the_job_route() -> TestRes
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "MineSkin job completed but no skin data provided" })
+        json!({ "error": "MineSkin job completed but no skin data provided", "code": "mineskin_error" })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_ready_when_the_required_configuration_is_usable() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+
+    let response = get(&app, "/ready").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await?, json!({ "status": "READY" }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn uses_the_cloudflare_ray_id_as_the_request_id() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+
+    let response = send(
+        &app,
+        Request::get("/health")
+            .header("cf-ray", "8f1e2d3c4b5a6978-FRA")
+            .header("x-request-id", "chosen-by-the-client")
+            .body(Body::empty())?,
+    )
+    .await?;
+
+    assert_eq!(
+        response.headers().get("x-request-id"),
+        Some(&header::HeaderValue::from_static("8f1e2d3c4b5a6978-FRA"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn generates_a_request_id_without_a_cloudflare_ray_id() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+    let mut ids = BTreeSet::new();
+
+    for _ in 0..2 {
+        let response = send(
+            &app,
+            Request::get("/does-not-exist")
+                .header("x-request-id", "chosen-by-the-client")
+                .body(Body::empty())?,
+        )
+        .await?;
+        let id = response
+            .headers()
+            .get("x-request-id")
+            .ok_or_else(|| io::Error::other("response has no x-request-id header"))?
+            .to_str()?
+            .to_owned();
+        uuid::Uuid::parse_str(&id)?;
+        ids.insert(id);
+    }
+
+    assert_eq!(ids.len(), 2, "each request needs its own ID: {ids:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn logs_each_request_with_its_id_and_without_the_query_string() -> TestResult {
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for CapturedLog {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("axolotl=info"))
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    // A thread-local subscriber misses log lines whose callsites other test
+    // threads register first, so this test installs the global one. Other
+    // tests log into it too, so the checks look only at this test's IDs.
+    tracing::subscriber::set_global_default(subscriber)?;
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+
+    let probe = send(
+        &app,
+        Request::get("/ready")
+            .header("cf-ray", "probe-ray")
+            .body(Body::empty())?,
+    )
+    .await?;
+    assert_eq!(probe.status(), StatusCode::OK);
+    let decrypt = send(
+        &app,
+        Request::get("/mineskin/decrypt-url?encryptedUrl=secret-encrypted-value")
+            .header("cf-ray", "decrypt-ray")
+            .body(Body::empty())?,
+    )
+    .await?;
+    assert_eq!(decrypt.status(), StatusCode::BAD_REQUEST);
+    // MineSkin is unreachable, so the handler logs an error inside the request.
+    let capes = send(
+        &app,
+        Request::get("/mineskin/capes")
+            .header("cf-ray", "capes-ray")
+            .body(Body::empty())?,
+    )
+    .await?;
+    assert!(capes.status().is_server_error(), "{}", capes.status());
+
+    let output = String::from_utf8(
+        log.0
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .clone(),
+    )?;
+    let lines_for = |request_id: &str| {
+        let field = format!("request_id={request_id}");
+        output
+            .lines()
+            .filter(|line| line.contains(&field))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        lines_for("probe-ray"),
+        Vec::<String>::new(),
+        "probes must not log at info"
+    );
+    let decrypt_lines = lines_for("decrypt-ray");
+    assert_eq!(decrypt_lines.len(), 1, "{decrypt_lines:?}");
+    assert!(
+        decrypt_lines
+            .iter()
+            .all(|line| line.contains("Request completed")
+                && line.contains("method=GET")
+                && line.contains("path=/mineskin/decrypt-url ")
+                && line.contains("status=400")
+                && line.contains("latency_ms=")),
+        "{decrypt_lines:?}"
+    );
+    assert!(
+        !output.contains("secret-encrypted-value"),
+        "the log must not contain the query string: {output}"
+    );
+    let capes_lines = lines_for("capes-ray");
+    assert!(
+        capes_lines.len() >= 2
+            && capes_lines
+                .last()
+                .is_some_and(|line| line.contains("Request completed")),
+        "log lines inside a request must carry its ID: {capes_lines:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_the_job_state_so_clients_can_resume_a_pending_upload() -> TestResult {
+    for status in ["waiting", "active", "processing"] {
+        let server = MockServer::start().await;
+        job_status_mock(
+            200,
+            json!({
+                "success": true,
+                "job": { "id": "job-1", "status": status, "result": null }
+            }),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        let app = mock_app(&server)?;
+
+        let response = get(&app, "/mineskin/jobs/job-1").await?;
+
+        assert_eq!(response.status(), StatusCode::OK, "status {status}");
+        let body = json_body(response).await?;
+        assert_eq!(body.get("skin"), Some(&Value::Null), "status {status}");
+        assert_eq!(
+            body.get("job"),
+            Some(&json!({ "id": "job-1", "status": status })),
+            "status {status}"
+        );
+        server.verify().await;
+    }
+    Ok(())
+}
+
+#[test]
+fn openapi_document_lists_every_error_code() -> TestResult {
+    let value = serde_json::to_value(api_document(4242))?;
+    let codes = value
+        .pointer("/components/schemas/ErrorCode/enum")
+        .and_then(Value::as_array)
+        .ok_or_else(|| io::Error::other("OpenAPI document did not list the error codes"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+
+    for code in [
+        "invalid_wait_ms",
+        "invalid_upload",
+        "unsupported_cape",
+        "invalid_job_id",
+        "invalid_encrypted_url",
+        "payload_too_large",
+        "upload_body_timeout",
+        "upload_busy",
+        "upload_timeout",
+        "job_not_found",
+        "job_timeout",
+        "mineskin_rate_limited",
+        "mineskin_error",
+        "not_configured",
+        "not_found",
+        "method_not_allowed",
+    ] {
+        assert!(codes.contains(code), "missing error code {code}");
+    }
+    assert_eq!(
+        value.pointer("/components/schemas/ErrorResponse/required"),
+        Some(&json!(["error", "code"]))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwards_the_mineskin_retry_after_on_rate_limits() -> TestResult {
+    for (upstream_retry_after, expected) in [(Some("30"), Some("30")), (None, None)] {
+        let server = MockServer::start().await;
+        let mut template = ResponseTemplate::new(429).set_body_json(json!({
+            "success": false,
+            "errors": [{ "message": "rate limit exceeded" }]
+        }));
+        if let Some(value) = upstream_retry_after {
+            template = template.insert_header("Retry-After", value);
+        }
+        Mock::given(method("GET"))
+            .and(path("/v2/capes"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let app = mock_app(&server)?;
+
+        let response = get(&app, "/mineskin/capes").await?;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            expected,
+            "upstream Retry-After {upstream_retry_after:?}"
+        );
+        assert_eq!(
+            json_body(response).await?,
+            json!({ "error": "rate limit exceeded", "code": "mineskin_rate_limited" })
+        );
+    }
     Ok(())
 }
