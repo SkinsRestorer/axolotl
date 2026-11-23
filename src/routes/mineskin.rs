@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
+use tracing::warn;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -30,6 +31,9 @@ const MAXIMUM_POLL_INTERVAL_MS: u64 = 10_000;
 const INVALID_WAIT_MS_MESSAGE: &str = "waitMs must be an integer between 250 and 10000";
 const MAXIMUM_FILE_SIZE: usize = 5 * 1024 * 1024;
 const MAXIMUM_JOB_ID_LENGTH: usize = 64;
+const MAXIMUM_NAME_LENGTH: usize = 48;
+const INVALID_NAME_MESSAGE: &str =
+    "name must be at most 48 letters, digits, spaces, dots, hyphens, or underscores";
 const INVALID_JOB_ID_MESSAGE: &str =
     "jobId must contain 1 to 64 letters, digits, hyphens, or underscores";
 
@@ -58,7 +62,7 @@ pub struct UploadRequest {
     #[schema(value_type = String, format = Binary)]
     file: String,
     variant: UploadVariant,
-    #[schema(min_length = 1, max_length = 64)]
+    #[schema(min_length = 1, max_length = 48, pattern = "^[A-Za-z0-9_. -]+$")]
     name: Option<String>,
     #[schema(value_type = String, format = Uuid)]
     cape_uuid: String,
@@ -97,7 +101,7 @@ pub struct DecryptedUrlResponse {
         (status = 200, description = "MineSkin job completed successfully.", body = SanitizedResponse),
         (status = 400, description = "Invalid request payload.", body = ErrorResponse),
         (status = 408, description = "The upload body was not received in time.", body = ErrorResponse),
-        (status = 413, description = "The upload body exceeds the size limit.", body = ErrorResponse),
+        (status = 413, description = "The skin file or the upload body exceeds the size limit.", body = ErrorResponse),
         (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
         (status = 500, description = "MineSkin proxy configuration error.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error.", body = ErrorResponse),
@@ -312,7 +316,10 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
                 let content_type = field.content_type().map(str::to_owned);
                 let bytes = field.bytes().await.map_err(map_multipart_error)?;
                 if bytes.len() > MAXIMUM_FILE_SIZE {
-                    return Err(ApiError::bad_request("Skin file must not exceed 5 MiB"));
+                    return Err(ApiError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Skin file must not exceed 5 MiB",
+                    ));
                 }
                 file = Some((bytes, file_name, content_type));
             }
@@ -343,13 +350,15 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
             "name must contain at least 1 character",
         ));
     }
-    if name
-        .as_ref()
-        .is_some_and(|value| value.encode_utf16().count() > 64)
-    {
-        return Err(ApiError::bad_request(
-            "name must contain at most 64 characters",
-        ));
+    // MineSkin rejects other names with a generic "Validation error", so check
+    // its rule here and say what is wrong.
+    if name.as_ref().is_some_and(|value| {
+        value.len() > MAXIMUM_NAME_LENGTH
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b' ')
+            })
+    }) {
+        return Err(ApiError::bad_request(INVALID_NAME_MESSAGE));
     }
 
     let cape_uuid = cape_uuid
@@ -454,6 +463,11 @@ fn map_proxy_error(error: MineSkinClientError) -> ApiError {
 /// as its source. Transport errors get a generic message because reqwest
 /// includes the upstream URL in its error text.
 fn mineskin_error(error: MineSkinClientError, status: StatusCode) -> ApiError {
+    // A 429 comes from the proxy's shared MineSkin account, not the client, so
+    // operators need to see it even though it is a 4xx.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        warn!(%error, "MineSkin rate limit reached");
+    }
     let message = match &error {
         MineSkinClientError::Request(_) => "MineSkin request failed".to_owned(),
         MineSkinClientError::Configuration(_)
