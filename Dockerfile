@@ -1,5 +1,5 @@
 # Keep the Rust version equal to rust-toolchain.toml, or rustup downloads it during the build.
-FROM docker.io/library/rust:1.95.0-slim-trixie@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0 AS build
+FROM docker.io/library/rust:1.100.0-slim-trixie@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS build
 WORKDIR /app
 COPY . .
 # The startup log shows this commit. A build without it logs `unknown`.
