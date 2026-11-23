@@ -211,7 +211,9 @@ impl LatencySnapshot {
 
     #[must_use]
     pub(crate) fn count(&self) -> u64 {
-        self.buckets.iter().sum()
+        self.buckets
+            .iter()
+            .fold(0_u64, |count, bucket| count.saturating_add(*bucket))
     }
 
     /// Returns the upper bound of the bucket that holds the percentile, or
@@ -400,7 +402,15 @@ impl LatencyHistogram {
 mod tests {
     use std::{net::IpAddr, str::FromStr, sync::Arc, thread, time::Duration};
 
-    use super::Metrics;
+    use super::{LATENCY_BUCKET_UPPER_BOUNDS_MS, LatencySnapshot, Metrics};
+
+    #[test]
+    fn saturates_the_latency_count_instead_of_overflowing() {
+        let latency = LatencySnapshot {
+            buckets: [u64::MAX; LATENCY_BUCKET_UPPER_BOUNDS_MS.len()],
+        };
+        assert_eq!(latency.count(), u64::MAX);
+    }
 
     #[test]
     fn never_snapshots_more_mineskin_errors_than_mineskin_calls() {

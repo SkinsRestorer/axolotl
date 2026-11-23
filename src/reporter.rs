@@ -17,7 +17,7 @@ use tokio::{
 use tracing::{error, info};
 
 use crate::{
-    http_client,
+    BUILD_COMMIT, http_client,
     metrics::{EndpointSnapshot, LatencySnapshot, Metrics, MetricsSnapshot},
 };
 
@@ -202,9 +202,11 @@ fn build_report(snapshot: &MetricsSnapshot, host: &HostStats) -> serde_json::Val
 /// Overall health of one report window.
 ///
 /// Rates, not counts, decide the status, so a busy window with a few stray
-/// errors stays healthy. A rate only counts once at least
+/// errors stays healthy. A rate only counts fully once at least
 /// [`MIN_ERRORS_FOR_STATUS`] errors back it, so one failure in a quiet window
-/// does not mark the service as failing. The headline still shows every error.
+/// does not mark the service as failing. Below that count, a rate that would
+/// be Failing shows as Degraded, so a quiet service where every request fails
+/// does not report Healthy. The headline still shows every error.
 ///
 /// | Signal                                          | Degraded | Failing |
 /// |-------------------------------------------------|----------|---------|
@@ -252,11 +254,19 @@ impl Status {
         degraded_percent: Option<f64>,
         failing_percent: Option<f64>,
     ) -> Self {
-        if errors < MIN_ERRORS_FOR_STATUS {
+        if errors == 0 {
             return Self::Healthy;
         }
         let rate = percentage(errors, total);
-        if failing_percent.is_some_and(|threshold| rate >= threshold) {
+        let failing = failing_percent.is_some_and(|threshold| rate >= threshold);
+        if errors < MIN_ERRORS_FOR_STATUS {
+            return if failing {
+                Self::Degraded
+            } else {
+                Self::Healthy
+            };
+        }
+        if failing {
             Self::Failing
         } else if degraded_percent.is_some_and(|threshold| rate >= threshold) {
             Self::Degraded
@@ -291,9 +301,9 @@ fn headline(snapshot: &MetricsSnapshot) -> String {
     let mut parts = Vec::new();
     if snapshot.server_errors > 0 {
         parts.push(format!(
-            "{} ({:.1}%)",
+            "{} ({})",
             plural(snapshot.server_errors, "server error", "server errors"),
-            percentage(snapshot.server_errors, snapshot.requests)
+            format_percentage(snapshot.server_errors, snapshot.requests)
         ));
     }
     let errors = snapshot.mineskin_errors;
@@ -343,7 +353,7 @@ fn mineskin_stats(snapshot: &MetricsSnapshot) -> String {
         return "No calls".to_owned();
     }
     format!(
-        "{}\nErrors: {} · Rate limits: {}\n{}",
+        "{}\nErrors: {} ({} rate limits)\n{}",
         plural(snapshot.mineskin_requests, "call", "calls"),
         format_number(snapshot.mineskin_errors),
         format_number(snapshot.mineskin_rate_limits),
@@ -353,7 +363,10 @@ fn mineskin_stats(snapshot: &MetricsSnapshot) -> String {
 
 fn client_stats(snapshot: &MetricsSnapshot) -> String {
     let unique_clients = u64::try_from(snapshot.client_requests.len()).unwrap_or(u64::MAX);
-    let attributed_requests = snapshot.client_requests.values().sum::<u64>();
+    let attributed_requests = snapshot
+        .client_requests
+        .values()
+        .fold(0_u64, |sum, requests| sum.saturating_add(*requests));
     let top_client_requests = snapshot
         .client_requests
         .values()
@@ -367,8 +380,8 @@ fn client_stats(snapshot: &MetricsSnapshot) -> String {
     } else {
         lines.push(plural(unique_clients, "unique IP", "unique IPs"));
         lines.push(format!(
-            "Top IP: {:.1}% of requests",
-            percentage(top_client_requests, attributed_requests)
+            "Top IP: {} of requests",
+            format_percentage(top_client_requests, attributed_requests)
         ));
     }
     if snapshot.unattributed_requests > 0 {
@@ -386,10 +399,29 @@ fn footer(snapshot: &MetricsSnapshot, host: &HostStats) -> String {
         .map_or_else(|| "unavailable".to_owned(), format_bytes);
     let load_average = host.load_average.as_deref().unwrap_or("unavailable");
     format!(
-        "Axolotl v{} · up {} · RSS {rss} · load {load_average}",
+        "Axolotl v{} ({}) · up {} · RSS {rss} · load {load_average}",
         env!("CARGO_PKG_VERSION"),
+        short_commit(BUILD_COMMIT),
         format_duration(snapshot.uptime)
     )
+}
+
+/// Shortens a full Git hash to the 7 characters Git shows by default.
+fn short_commit(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+/// Formats a share with one decimal, but never rounds a nonzero share down to
+/// "0.0%" or a partial share up to "100.0%".
+fn format_percentage(part: u64, total: u64) -> String {
+    let rate = percentage(part, total);
+    if part > 0 && rate < 0.05 {
+        "<0.1%".to_owned()
+    } else if part < total && rate >= 99.95 {
+        ">99.9%".to_owned()
+    } else {
+        format!("{rate:.1}%")
+    }
 }
 
 fn plural(count: u64, singular: &str, plural: &str) -> String {
@@ -518,8 +550,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::{
-        HostStats, Metrics, MetricsSnapshot, Status, build_report, format_bytes,
-        format_report_period, p95, run, send_report,
+        HostStats, Metrics, MetricsSnapshot, Status, build_report, format_bytes, format_percentage,
+        format_report_period, p95, run, send_report, short_commit,
     };
 
     const fn no_host_stats() -> HostStats {
@@ -556,6 +588,23 @@ mod tests {
         }
         parts.push(("footer".to_owned(), text(report, "/embeds/0/footer/text")));
         parts
+    }
+
+    /// Renders the embed as plain text, one `[part]` block per part.
+    fn render(report: &Value) -> String {
+        embed_text(report)
+            .into_iter()
+            .map(|(name, value)| format!("[{name}]\n{value}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn footer_prefix() -> String {
+        format!(
+            "Axolotl v{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            short_commit(crate::BUILD_COMMIT)
+        )
     }
 
     fn assert_within_discord_limits(report: &Value) {
@@ -635,14 +684,10 @@ mod tests {
                 load_average: Some("0.42 / 0.37 / 0.30".to_owned()),
             },
         );
-        let rendered = embed_text(&report)
-            .into_iter()
-            .map(|(name, value)| format!("[{name}]\n{value}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let rendered = render(&report);
         println!("{rendered}");
 
-        let version = env!("CARGO_PKG_VERSION");
+        let footer = footer_prefix();
         assert_eq!(
             rendered,
             format!(
@@ -650,9 +695,9 @@ mod tests {
                  [description]\n6 server errors (0.2%) · 4 MineSkin errors (2 rate limits) · 2,455 requests in 5 min\n\n\
                  [Uploads]\n1,820 requests\n5xx: 6 · 4xx: 41\np95 ≤ 2.5 s\n\n\
                  [Decryptions]\n610 requests\n5xx: 0 · 4xx: 3\np95 ≤ 5 ms\n\n\
-                 [MineSkin]\n1,912 calls\nErrors: 4 · Rate limits: 2\np95 ≤ 2.5 s\n\n\
+                 [MineSkin]\n1,912 calls\nErrors: 4 (2 rate limits)\np95 ≤ 2.5 s\n\n\
                  [Clients]\n312 unique IPs\nTop IP: 6.2% of requests\nUnattributed: 3 requests\n\n\
-                 [footer]\nAxolotl v{version} · up 3d 4h 12m 5s · RSS 48.29 MiB · load 0.42 / 0.37 / 0.30"
+                 [footer]\n{footer} · up 3d 4h 12m 5s · RSS 48.29 MiB · load 0.42 / 0.37 / 0.30"
             )
         );
         assert_eq!(
@@ -665,6 +710,7 @@ mod tests {
     #[test]
     fn renders_an_idle_window_without_empty_fields() {
         let report = build_report(&MetricsSnapshot::default(), &no_host_stats());
+        println!("{}", render(&report));
         let text = embed_text(&report);
         let value = |name: &str| {
             text.iter()
@@ -679,8 +725,113 @@ mod tests {
         assert_eq!(value("Decryptions"), "No requests");
         assert_eq!(value("MineSkin"), "No calls");
         assert_eq!(value("Clients"), "No client IPs");
-        assert!(value("footer").ends_with("RSS unavailable · load unavailable"));
+        assert_eq!(
+            value("footer"),
+            format!(
+                "{} · up 0s · RSS unavailable · load unavailable",
+                footer_prefix()
+            )
+        );
         assert_within_discord_limits(&report);
+    }
+
+    /// Records a quiet window while `MineSkin` rate limits and fails most calls.
+    fn failing_window() -> MetricsSnapshot {
+        let metrics = Metrics::default();
+        let client = IpAddr::from([203, 0, 113, 7]);
+        for upload in 0..90 {
+            let status = if upload < 38 { 503 } else { 200 };
+            metrics.record_request(
+                "/mineskin/skins",
+                status,
+                Some(client),
+                Duration::from_secs(12),
+            );
+        }
+        for _ in 0..30 {
+            metrics.record_request(
+                "/mineskin/decrypt-url",
+                200,
+                Some(IpAddr::from([203, 0, 113, 8])),
+                Duration::from_millis(3),
+            );
+        }
+        for call in 0..40 {
+            metrics.finish_mineskin_request(Duration::from_secs(9), call < 38, call < 31);
+        }
+        let mut window = metrics
+            .snapshot()
+            .since(&MetricsSnapshot::default(), Duration::from_mins(5));
+        window.uptime = Duration::from_mins(2 * 60 + 5);
+        window
+    }
+
+    #[test]
+    fn renders_a_failing_window() {
+        let report = build_report(&failing_window(), &no_host_stats());
+        let rendered = render(&report);
+        println!("{rendered}");
+
+        let footer = footer_prefix();
+        assert_eq!(
+            rendered,
+            format!(
+                "[title]\nAxolotl: Failing\n\n\
+                 [description]\n38 server errors (31.7%) · 38 MineSkin errors (31 rate limits) · 120 requests in 5 min\n\n\
+                 [Uploads]\n90 requests\n5xx: 38 · 4xx: 0\np95 ≤ 30 s\n\n\
+                 [Decryptions]\n30 requests\n5xx: 0 · 4xx: 0\np95 ≤ 5 ms\n\n\
+                 [MineSkin]\n40 calls\nErrors: 38 (31 rate limits)\np95 ≤ 10 s\n\n\
+                 [Clients]\n2 unique IPs\nTop IP: 75.0% of requests\n\n\
+                 [footer]\n{footer} · up 2h 5m 0s · RSS unavailable · load unavailable"
+            )
+        );
+        assert_eq!(
+            report.pointer("/embeds/0/color").and_then(Value::as_u64),
+            Some(0x00e7_4c3c)
+        );
+        assert_within_discord_limits(&report);
+    }
+
+    #[test]
+    fn does_not_overflow_when_summing_client_requests() {
+        let snapshot = MetricsSnapshot {
+            requests: u64::MAX,
+            client_requests: [
+                (IpAddr::from([192, 0, 2, 1]), u64::MAX),
+                (IpAddr::from([192, 0, 2, 2]), u64::MAX),
+            ]
+            .into(),
+            ..MetricsSnapshot::default()
+        };
+        let report = build_report(&snapshot, &no_host_stats());
+        let clients = embed_text(&report)
+            .into_iter()
+            .find(|(name, _)| name == "Clients")
+            .map(|(_, value)| value)
+            .expect("the report should have a Clients field");
+
+        assert_eq!(clients, "2 unique IPs\nTop IP: 100.0% of requests");
+    }
+
+    #[test]
+    fn keeps_small_and_partial_shares_distinguishable() {
+        assert_eq!(format_percentage(0, 0), "0.0%");
+        assert_eq!(format_percentage(0, 100), "0.0%");
+        assert_eq!(format_percentage(1, 100_000), "<0.1%");
+        assert_eq!(format_percentage(1, 2_000), "0.1%");
+        assert_eq!(format_percentage(6, 2_455), "0.2%");
+        assert_eq!(format_percentage(99_999, 100_000), ">99.9%");
+        assert_eq!(format_percentage(100, 100), "100.0%");
+    }
+
+    #[test]
+    fn shortens_the_build_commit() {
+        assert_eq!(
+            short_commit("11c780e0123456789abcdef0123456789abcdef0"),
+            "11c780e"
+        );
+        assert_eq!(short_commit("unknown"), "unknown");
+        assert_eq!(short_commit("abc"), "abc");
     }
 
     #[test]
@@ -757,8 +908,14 @@ mod tests {
         assert_eq!(status(10_000, 50, 0, 0, 0), Status::Healthy);
         assert_eq!(status(100, 3, 0, 0, 0), Status::Degraded);
         assert_eq!(status(100, 5, 0, 0, 0), Status::Failing);
-        // Too few errors to judge a rate, however high it is.
-        assert_eq!(status(2, 2, 2, 2, 2), Status::Healthy);
+        assert_eq!(status(0, 0, 0, 0, 0), Status::Healthy);
+        // Too few errors to judge a rate: a low rate stays healthy, and even a
+        // total outage only reaches Degraded.
+        assert_eq!(status(200, 2, 0, 0, 0), Status::Healthy);
+        assert_eq!(status(10, 1, 0, 0, 0), Status::Degraded);
+        assert_eq!(status(2, 2, 2, 2, 2), Status::Degraded);
+        assert_eq!(status(0, 0, 10, 2, 2), Status::Healthy);
+        assert_eq!(status(0, 0, 2, 1, 1), Status::Degraded);
         assert_eq!(status(0, 0, 100, 9, 0), Status::Healthy);
         assert_eq!(status(0, 0, 100, 10, 0), Status::Degraded);
         assert_eq!(status(0, 0, 100, 50, 0), Status::Failing);
