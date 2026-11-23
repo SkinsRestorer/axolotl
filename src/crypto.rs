@@ -1,3 +1,22 @@
+//! Encrypts `MineSkin` skin URLs so clients can store them without learning the
+//! skin ID, and decrypts them again.
+//!
+//! The key is the SHA-256 digest of `AES_SECRET_KEY`. An encrypted URL is
+//! `skinsrestorer-axolotl://` followed by one of two payloads:
+//!
+//! - v2, issued today: `v2/` + unpadded URL-safe base64 of a 12-byte random
+//!   nonce, then the AES-256-GCM ciphertext and its 16-byte tag. The additional
+//!   authenticated data is `skinsrestorer-axolotl:v2`.
+//! - Legacy: padded standard base64 of a 16-byte random IV, then the
+//!   AES-256-CBC ciphertext with PKCS#7 padding. It is only decrypted, because
+//!   clients still hold these URLs.
+//!
+//! The plaintext is the skin UUID in any form [`Uuid::parse_str`] accepts.
+//! Decryption always returns it as 32 hex digits without hyphens.
+//!
+//! Both formats are part of the public contract: every URL issued so far must
+//! keep decrypting, so never change the key derivation, the layout or the AAD.
+
 #![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 #[cfg(test)]
@@ -270,6 +289,24 @@ mod tests {
         let decrypted = cipher.decrypt_url(&format!("{ENCRYPTED_URL_SCHEME}{LEGACY_PAYLOAD}"))?;
 
         assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{SKIN_ID}"));
+        Ok(())
+    }
+
+    /// Pins the v2 format, so a change to the key derivation, layout or AAD
+    /// cannot silently break URLs that clients already hold.
+    #[test]
+    fn matches_authenticated_crypto_vector() -> Result<(), CryptoError> {
+        const AUTHENTICATED_URL: &str = "skinsrestorer-axolotl://v2/KioqKioqKioqKioqtq5dgUTJfE0GET3jz43Tjm7slJRHdn_eLAln1DC8dmvjOReZDYMkNvS5iplMDo9r";
+        let cipher = UrlCipher::new(Some("test-secret"));
+
+        assert_eq!(
+            cipher.encrypt_uuid_with_nonce(SKIN_ID, [0x2a; GCM_NONCE_LENGTH])?,
+            AUTHENTICATED_URL
+        );
+        assert_eq!(
+            cipher.decrypt_url(AUTHENTICATED_URL)?,
+            format!("{MINESKIN_URL_PREFIX}{SKIN_ID}")
+        );
         Ok(())
     }
 
