@@ -135,6 +135,33 @@ async fn maps_mineskin_job_not_found_to_the_public_contract() -> TestResult {
 }
 
 #[tokio::test]
+async fn preserves_upstream_status_for_non_json_error_pages() -> TestResult {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/queue/limited"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_raw("<html><body>Too Many Requests</body></html>", "text/html"),
+        )
+        .mount(&server)
+        .await;
+    let app = test_app(&format!("{}/v2/", server.uri()))?;
+
+    let response = send(
+        &app,
+        Request::get("/mineskin/jobs/limited").body(Body::empty())?,
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "MineSkin request failed with status 429 Too Many Requests" })
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn accepts_new_upstream_job_statuses_without_parsing_unused_fields() -> TestResult {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

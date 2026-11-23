@@ -403,6 +403,9 @@ impl MineSkinClient {
 
             self.metrics.record_mineskin_response_bytes(body.len());
             let buffered = BufferedResponse { status, body };
+            if !status.is_success() {
+                return Err(parse_error_response(context, &buffered));
+            }
             let response = parse_response(context, &buffered)?;
 
             ensure_upstream_success(status, response)
@@ -528,6 +531,27 @@ fn parse_response<T: DeserializeOwned>(
             message: source.to_string(),
         }
     })
+}
+
+/// Keeps the upstream status even when a proxy or CDN in front of `MineSkin`
+/// returns an error page that is not JSON.
+fn parse_error_response(context: &'static str, response: &BufferedResponse) -> MineSkinClientError {
+    match serde_json::from_slice::<MineSkinResponse>(&response.body) {
+        Ok(body) => MineSkinClientError::upstream(response.status, body.into_error_message()),
+        Err(source) => {
+            warn!(
+                context,
+                status = %response.status,
+                response_size = response.body.len(),
+                %source,
+                "MineSkin returned a non-JSON error response"
+            );
+            MineSkinClientError::upstream(
+                response.status,
+                format!("MineSkin request failed with status {}", response.status),
+            )
+        }
+    }
 }
 
 fn ensure_upstream_success(
