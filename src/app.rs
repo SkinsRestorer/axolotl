@@ -7,13 +7,17 @@ use std::{
 use axum::{
     Router,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{HeaderValue, Method, StatusCode, header::LOCATION},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header::LOCATION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use tokio::{sync::Semaphore, time::timeout};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    request_id::{MakeRequestUuid, RequestId, SetRequestIdLayer},
+};
+use tracing::{Instrument, debug, info, info_span};
 use utoipa::{
     OpenApi,
     openapi::{OpenApi as OpenApiDocument, Server},
@@ -23,22 +27,37 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 use crate::{
     config::AppConfig,
     crypto::UrlCipher,
-    error::{ApiError, ErrorResponse},
+    error::{ApiError, ErrorCode, ErrorResponse},
     metrics::Metrics,
     mineskin::MineSkinClient,
     routes::{
-        __path_cape_support, __path_decrypt_url, __path_health, __path_job_status,
+        __path_cape_support, __path_decrypt_url, __path_health, __path_job_status, __path_ready,
         __path_supported_capes, __path_upload_skin, DecryptedUrlResponse, HealthResponse,
-        UploadRequest, cape_support, decrypt_url, health, job_status, supported_capes, upload_skin,
+        ReadinessResponse, UploadRequest, cape_support, decrypt_url, health, job_status, ready,
+        supported_capes, upload_skin,
     },
 };
 
 const MAXIMUM_REQUEST_BODY_SIZE: usize = 6 * 1024 * 1024;
 
+/// Cloudflare's ID for a request, which Axolotl reuses as its own request ID.
+const CF_RAY: HeaderName = HeaderName::from_static("cf-ray");
+const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+
+/// How long a client should wait before it retries an upload that was rejected
+/// because every upload slot was busy. Uploads usually take a few seconds.
+const UPLOAD_BUSY_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// Paths that container probes call often. Their access log lines use the
+/// debug level, so they do not flood the log.
+const PROBE_PATHS: [&str; 2] = ["/health", "/ready"];
+
 pub(crate) struct AppState {
     pub mineskin: MineSkinClient,
     pub cipher: UrlCipher,
     pub upload_body_timeout: Duration,
+    /// Required environment variables that are missing or unusable.
+    pub missing_configuration: Vec<&'static str>,
     upload_slots: Arc<Semaphore>,
     upload_request_timeout: Duration,
 }
@@ -48,19 +67,20 @@ pub(crate) struct AppState {
     info(title = "Axolotl", description = "A lightweight MineSkin proxy API"),
     paths(
         health,
+        ready,
         upload_skin,
         job_status,
         supported_capes,
         cape_support,
         decrypt_url
     ),
-    components(schemas(HealthResponse, UploadRequest, DecryptedUrlResponse, ErrorResponse)),
+    components(schemas(HealthResponse, ReadinessResponse, UploadRequest, DecryptedUrlResponse, ErrorResponse)),
     tags(
         (
             name = "mineskin",
             description = "MineSkin proxy endpoints that inject the configured API key."
         ),
-        (name = "health", description = "Health check endpoint")
+        (name = "health", description = "Liveness and readiness checks")
     )
 )]
 struct ApiDoc;
@@ -79,6 +99,7 @@ pub fn build_app(
         mineskin: MineSkinClient::new(config, cipher.clone(), Arc::clone(&metrics))?,
         cipher,
         upload_body_timeout: config.request_timeout,
+        missing_configuration: missing_configuration(config),
         upload_slots: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
         upload_request_timeout: config
             .max_poll_duration
@@ -89,6 +110,7 @@ pub fn build_app(
     let api = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route(
             "/mineskin/skins",
             post(upload_skin).route_layer(middleware::from_fn_with_state(
@@ -111,9 +133,67 @@ pub fn build_app(
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                 .allow_headers(Any),
         )
-        .layer(middleware::from_fn_with_state(metrics, record_metrics));
+        .layer(middleware::from_fn_with_state(metrics, record_metrics))
+        .layer(middleware::from_fn(log_request))
+        // Cloudflare sets `cf-ray` on every request it forwards. Requests that
+        // reach the container directly, such as probes, get a random ID.
+        .layer(SetRequestIdLayer::new(CF_RAY, MakeRequestUuid));
 
     Ok(api)
+}
+
+/// Lists the required environment variables that the service cannot use.
+///
+/// It applies the same checks as the code that uses each value, so readiness
+/// agrees with whether requests can succeed.
+fn missing_configuration(config: &AppConfig) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if crate::mineskin::authorization_header(config.mineskin_api_key.as_deref()).is_none() {
+        missing.push("MINESKIN_API_KEY");
+    }
+    // `UrlCipher::new` ignores a blank secret, exactly like this check.
+    if !config.has_aes_secret_key() {
+        missing.push("AES_SECRET_KEY");
+    }
+    missing
+}
+
+/// Runs the request in a span that carries its ID, logs one line when the
+/// response is ready and returns the ID in the `x-request-id` header.
+///
+/// The line has the path without the query string, because `decrypt-url`
+/// receives encrypted skin URLs in the query.
+async fn log_request(request: Request, next: Next) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.header_value().clone());
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let span = info_span!(
+        "request",
+        request_id = %request_id
+            .as_ref()
+            .and_then(|id| id.to_str().ok())
+            .unwrap_or_default(),
+    );
+
+    let started_at = Instant::now();
+    let mut response = next.run(request).instrument(span.clone()).await;
+    let latency_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    let status = response.status().as_u16();
+    span.in_scope(|| {
+        if PROBE_PATHS.contains(&path.as_str()) {
+            debug!(%method, %path, status, latency_ms, "Request completed");
+        } else {
+            info!(%method, %path, status, latency_ms, "Request completed");
+        }
+    });
+
+    if let Some(request_id) = request_id {
+        response.headers_mut().insert(X_REQUEST_ID, request_id);
+    }
+    response
 }
 
 async fn record_metrics(
@@ -191,12 +271,15 @@ async fn guard_upload(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many skin uploads are already in progress",
         )
+        .with_code(ErrorCode::UploadBusy)
+        .with_retry_after(UPLOAD_BUSY_RETRY_AFTER)
         .into_response();
     };
 
     match timeout(state.upload_request_timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_) => ApiError::new(StatusCode::GATEWAY_TIMEOUT, "Skin upload request timed out")
+            .with_code(ErrorCode::UploadTimeout)
             .into_response(),
     }
 }
@@ -318,6 +401,107 @@ mod tests {
         assert_eq!(
             client_ip(&request),
             Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
+        );
+    }
+
+    fn test_config() -> AppConfig {
+        AppConfig::for_tests(Url::parse("http://127.0.0.1:9/v2/").expect("valid URL"))
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        serde_json::from_slice(&bytes).expect("body should be JSON")
+    }
+
+    #[tokio::test]
+    async fn reports_unusable_configuration_by_name_without_values() {
+        let mut config = test_config();
+        // The client rejects a bare "Bearer" and the cipher ignores a blank secret.
+        config.mineskin_api_key = Some("Bearer ".to_owned());
+        config.aes_secret_key = Some("   ".to_owned());
+        let app = build_app(&config, Arc::new(Metrics::default())).expect("app should build");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/ready")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(response).await,
+            serde_json::json!({
+                "status": "NOT_READY",
+                "missing": ["MINESKIN_API_KEY", "AES_SECRET_KEY"]
+            })
+        );
+
+        let health = app
+            .oneshot(
+                Request::get("/health")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "liveness must not depend on configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn names_only_the_missing_variable() {
+        let mut config = test_config();
+        config.aes_secret_key = None;
+        let app = build_app(&config, Arc::new(Metrics::default())).expect("app should build");
+
+        let response = app
+            .oneshot(
+                Request::get("/ready")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(response).await,
+            serde_json::json!({ "status": "NOT_READY", "missing": ["AES_SECRET_KEY"] })
+        );
+    }
+
+    #[tokio::test]
+    async fn asks_clients_to_retry_when_every_upload_slot_is_busy() {
+        let mut config = test_config();
+        config.max_concurrent_uploads = 0;
+        let app = build_app(&config, Arc::new(Metrics::default())).expect("app should build");
+
+        let response = app
+            .oneshot(
+                Request::post("/mineskin/skins")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("5"))
+        );
+        assert_eq!(
+            json_body(response).await,
+            serde_json::json!({
+                "error": "Too many skin uploads are already in progress",
+                "code": "upload_busy"
+            })
         );
     }
 }
