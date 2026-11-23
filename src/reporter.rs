@@ -114,12 +114,15 @@ async fn send_report(
     snapshot: &MetricsSnapshot,
 ) -> Result<(), reqwest::Error> {
     let server = server_stats(snapshot).await;
+    // The webhook URL contains its secret token, so keep it out of logged errors.
     client
         .post(webhook.clone())
         .json(&build_report(snapshot, &server))
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
     Ok(())
 }
 
@@ -452,9 +455,12 @@ async fn load_average() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, net::IpAddr, str::FromStr};
+    use std::{collections::HashMap, net::IpAddr, str::FromStr, time::Duration};
 
-    use super::{ClientInsight, MetricsSnapshot};
+    use url::Url;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    use super::{ClientInsight, MetricsSnapshot, send_report};
 
     #[test]
     fn identifies_distributed_and_dominant_client_traffic() {
@@ -492,5 +498,33 @@ mod tests {
         assert_eq!(dominant.pattern, "One dominant client");
         assert_eq!(dominant.top_client_requests, 80);
         assert!((dominant.top_client_percentage - 80.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_webhook_token_out_of_report_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let webhook = Url::parse(&format!("{}/api/webhooks/1/secret-token", server.uri()))
+            .expect("test webhook URL should be valid");
+
+        let client = crate::http_client::builder(Duration::from_secs(2))
+            .build()
+            .expect("test HTTP client should build");
+
+        let error = send_report(&client, &webhook, &MetricsSnapshot::default())
+            .await
+            .expect_err("a 500 response should fail the report");
+
+        assert_eq!(
+            error.status(),
+            Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(
+            !error.to_string().contains("secret-token"),
+            "error should not include the webhook token: {error}"
+        );
     }
 }
