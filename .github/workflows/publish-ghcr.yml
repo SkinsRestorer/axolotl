@@ -15,8 +15,9 @@ on:
 
 permissions: {}
 
-# Queue runs instead of cancelling them. A cancelled run could stop after the
-# tags moved but before Dokploy was told to deploy.
+# Never cancel a running publish. A cancelled run could stop after the tags
+# moved but before Dokploy was told to deploy. GitHub keeps only the newest
+# pending run, so a burst of pushes publishes the first and the last commit.
 concurrency:
   group: publish-ghcr
   cancel-in-progress: false
