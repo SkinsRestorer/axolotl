@@ -87,17 +87,16 @@ impl JobSuccessResponse {
         })
     }
 
+    /// Returns the skin ID of a completed job. A job in any other state has no
+    /// skin yet, so a response never shows a skin next to a pending status.
     #[must_use]
     pub fn skin_uuid(&self) -> Option<&str> {
+        if self.job.status != JobStatus::Completed {
+            return None;
+        }
         match self.skin.as_ref() {
             Some(SkinResult::Skin(skin)) => Some(&skin.uuid),
-            Some(SkinResult::Boolean(_)) | None => {
-                if self.job.status == JobStatus::Completed {
-                    self.job.result.as_deref()
-                } else {
-                    None
-                }
-            }
+            Some(SkinResult::Boolean(_)) | None => self.job.result.as_deref(),
         }
     }
 }
@@ -170,8 +169,8 @@ pub struct SanitizedResponse {
     /// Informational messages that `MineSkin` sent about the job. Empty when
     /// there are none.
     pub messages: Vec<MineSkinErrorItem>,
-    /// The `MineSkin` job behind this response. When an upload times out,
-    /// pass `job.id` to `GET /mineskin/jobs/{jobId}` to resume.
+    /// The `MineSkin` job behind this response. If an upload fails after the
+    /// job was queued, the error body carries the same ID as `jobId`.
     pub job: SanitizedJob,
 }
 
@@ -241,8 +240,8 @@ mod tests {
     use utoipa::ToSchema;
 
     use super::{
-        Cape, CapeSupportResponse, CapesResponse, JobStatus, MineSkinErrorItem, SanitizedJob,
-        SanitizedResponse, SanitizedSkin,
+        Cape, CapeSupportResponse, CapesResponse, JobStatus, JobSuccessResponse, MineSkinErrorItem,
+        SanitizedJob, SanitizedResponse, SanitizedSkin,
     };
     use crate::crypto::ENCRYPTED_URL_SCHEME;
 
@@ -412,6 +411,36 @@ mod tests {
                 .and_then(serde_json::to_value)
                 .ok();
             assert_eq!(serialized, Some(json!(expected)), "{upstream}");
+        }
+    }
+
+    #[test]
+    fn reads_the_skin_only_from_a_completed_job() {
+        for (status, expected) in [
+            ("completed", Some("skin-uuid")),
+            ("waiting", None),
+            ("processing", None),
+            ("failed", None),
+            ("scheduled", None),
+        ] {
+            let response = serde_json::from_value::<JobSuccessResponse>(json!({
+                "job": { "id": "job-1", "status": status, "result": "skin-uuid" },
+                "skin": { "uuid": "skin-uuid" }
+            }))
+            .ok();
+            let skin_uuid = response
+                .as_ref()
+                .map(|response| response.skin_uuid().map(str::to_owned));
+            assert_eq!(
+                skin_uuid,
+                Some(expected.map(str::to_owned)),
+                "status {status}"
+            );
+
+            let has_skin = response
+                .and_then(|response| response.into_sanitized(Some("encrypted".to_owned())).ok())
+                .map(|sanitized| sanitized.skin.is_some());
+            assert_eq!(has_skin, Some(expected.is_some()), "status {status}");
         }
     }
 }

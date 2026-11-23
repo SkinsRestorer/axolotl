@@ -36,7 +36,10 @@ const MINESKIN_USER_AGENT: &str = "Axolotl-MineSkin-Proxy/1.0";
 const MAXIMUM_UPSTREAM_RESPONSE_SIZE: usize = 1024 * 1024;
 const FAILURE_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAXIMUM_POLL_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// The longest `Retry-After` that the proxy passes on to its clients.
+const MAXIMUM_RETRY_AFTER: Duration = Duration::from_hours(1);
 const MAXIMUM_UNEXPECTED_POLL_RESPONSES: u32 = 3;
+const MAXIMUM_CACHED_FAILURE_WAIT: Duration = Duration::from_mins(1);
 const COMPLETED_WITHOUT_SKIN_MESSAGE: &str = "MineSkin job completed but no skin data provided";
 
 pub struct MineSkinClient {
@@ -299,7 +302,9 @@ impl MineSkinClient {
             && response.validate().is_ok()
             && response.skin_uuid().is_some()
         {
-            Some(self.sanitize_job(response)?)
+            // A skin that can't be encrypted, such as a malformed UUID, is left
+            // to the poll too, so the error keeps the job ID.
+            self.sanitize_job(response).ok()
         } else {
             None
         };
@@ -654,8 +659,15 @@ impl CachedFailure {
         }
     }
 
+    /// A failure is reused for the retry delay, or for as long as `MineSkin`
+    /// asked us to wait, up to a minute, so a rate limit is not hit again early.
     fn is_recent(&self) -> bool {
-        self.failed_at.elapsed() < FAILURE_RETRY_DELAY
+        let wait = self.retry_after.map_or(FAILURE_RETRY_DELAY, |retry_after| {
+            retry_after
+                .min(MAXIMUM_CACHED_FAILURE_WAIT)
+                .max(FAILURE_RETRY_DELAY)
+        });
+        self.failed_at.elapsed() < wait
     }
 
     fn to_error(&self) -> MineSkinClientError {
@@ -741,11 +753,23 @@ fn parse_error_response(
     error.with_retry_after(retry_after)
 }
 
-/// Reads a `Retry-After` header in seconds, the form that `MineSkin` sends.
-/// An HTTP date or a negative value counts as no header.
+/// Reads a `Retry-After` header as seconds or as an HTTP date. A date in the
+/// past means no wait. A value that is neither counts as no header. The wait
+/// is capped, so a broken value cannot tell clients to wait for years.
 fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
-    let seconds = value?.to_str().ok()?.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds))
+    let value = value?.to_str().ok()?.trim();
+    let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        // Only an overflow fails here, and such a value is above the cap.
+        value
+            .parse::<u64>()
+            .map_or(MAXIMUM_RETRY_AFTER, Duration::from_secs)
+    } else {
+        let date = jiff::fmt::rfc2822::DateTimeParser::new()
+            .parse_timestamp(value)
+            .ok()?;
+        Duration::try_from(date.duration_since(jiff::Timestamp::now())).unwrap_or_default()
+    };
+    Some(delay.min(MAXIMUM_RETRY_AFTER))
 }
 
 /// Records a `MineSkin` call when dropped. A call cancelled by a deadline or a
@@ -1742,7 +1766,15 @@ mod tests {
             (Some("7"), Some(Duration::from_secs(7))),
             (Some(" 0 "), Some(Duration::ZERO)),
             (Some("-1"), None),
-            (Some("Wed, 21 Oct 2015 07:28:00 GMT"), None),
+            (Some("+5"), None),
+            (Some("1.5"), None),
+            (Some(""), None),
+            (Some("soon"), None),
+            // A date in the past means MineSkin wants no wait.
+            (Some("Wed, 21 Oct 2015 07:28:00 GMT"), Some(Duration::ZERO)),
+            // Absurd waits are capped, including one that overflows a u64.
+            (Some("86400"), Some(MAXIMUM_RETRY_AFTER)),
+            (Some("99999999999999999999999"), Some(MAXIMUM_RETRY_AFTER)),
             (None, None),
         ] {
             let server = MockServer::start().await;
@@ -1765,6 +1797,21 @@ mod tests {
             assert_eq!(error.retry_after(), expected, "header {header:?}");
             server.verify().await;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reads_a_retry_after_http_date_as_the_time_left() -> TestResult {
+        let date = jiff::Timestamp::now()
+            .checked_add(jiff::SignedDuration::from_secs(120))?
+            .strftime("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+
+        let delay = parse_retry_after(Some(&HeaderValue::from_str(&date)?))
+            .ok_or_else(|| format!("{date} was not read"))?;
+
+        assert!(delay <= Duration::from_mins(2), "{date}: {delay:?}");
+        assert!(delay > Duration::from_secs(100), "{date}: {delay:?}");
         Ok(())
     }
 
@@ -1843,5 +1890,63 @@ mod tests {
             transient_retry_sleep(backoff, Some(Duration::from_secs(45))),
             MAXIMUM_POLL_RETRY_DELAY
         );
+    }
+
+    #[tokio::test]
+    async fn polls_a_duplicate_whose_skin_id_cannot_be_encrypted() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/queue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "job": { "id": "job-poll", "status": "completed", "result": "nope" },
+                "skin": { "uuid": "nope" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/queue/job-poll"))
+            .respond_with(completed_job())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = poll_test_client(&server, Duration::from_secs(5))?;
+
+        let job = client.enqueue(skin_upload()).await?;
+        let response = client.poll_job(job, Duration::ZERO).await?;
+
+        assert!(response.skin.is_some(), "the poll should supply the skin");
+        server.verify().await;
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_a_cached_failure_while_mineskin_asked_to_wait() {
+        let failure = |age: u64, retry_after: Option<u64>| CachedFailure {
+            failed_at: Instant::now()
+                .checked_sub(Duration::from_secs(age))
+                .expect("the test clock goes back far enough"),
+            configuration_error: false,
+            upstream_status: StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limited".to_owned(),
+            retry_after: retry_after.map(Duration::from_secs),
+        };
+
+        assert!(failure(3, None).is_recent(), "within the 5 s retry delay");
+        assert!(!failure(6, None).is_recent(), "after the 5 s retry delay");
+        assert!(
+            failure(20, Some(30)).is_recent(),
+            "within MineSkin's Retry-After"
+        );
+        assert!(
+            !failure(31, Some(30)).is_recent(),
+            "after MineSkin's Retry-After"
+        );
+        assert!(
+            failure(3, Some(1)).is_recent(),
+            "never shorter than the retry delay"
+        );
+        assert!(!failure(61, Some(3600)).is_recent(), "capped at one minute");
     }
 }
