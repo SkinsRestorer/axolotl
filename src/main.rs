@@ -11,11 +11,11 @@
     )
 )]
 
-use std::{error::Error, io, net::SocketAddr, sync::Arc};
+use std::{env, error::Error, io, net::SocketAddr, sync::Arc};
 
 use axolotl::{AppConfig, Metrics, build_app, reporter::DiscordReporter};
 use tokio::{net::TcpListener, signal};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -25,15 +25,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Err(error) = dotenv
         && !error.not_found()
     {
-        tracing::warn!(%error, "Failed to load .env");
+        warn!(%error, "Failed to load .env");
     }
 
     let config = AppConfig::from_env()?;
+    for warning in config.startup_warnings() {
+        warn!("{warning}");
+    }
     let port = config.port();
-    let address = SocketAddr::from(([0, 0, 0, 0], port));
     let metrics = Arc::new(Metrics::default());
     let app = build_app(&config, Arc::clone(&metrics))?;
-    let listener = TcpListener::bind(address).await?;
+    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    // Log the bound address so `PORT=0` shows the port the OS picked.
+    let address = listener.local_addr()?;
     let reporter = DiscordReporter::start(config.discord_webhook().cloned(), metrics);
     drop(config);
 
@@ -56,24 +60,37 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 fn init_tracing() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("axolotl=info,tower_http=info"));
+    let (filter, invalid_filter) = match EnvFilter::try_from_default_env() {
+        Ok(filter) => (filter, None),
+        Err(error) => (
+            EnvFilter::new("axolotl=info,tower_http=info"),
+            env::var_os(EnvFilter::DEFAULT_ENV).map(|_| error),
+        ),
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .try_init()?;
+    if let Some(error) = invalid_filter {
+        warn!(%error, "RUST_LOG is invalid, using the default log filter");
+    }
     Ok(())
 }
 
 async fn shutdown_signal() {
-    let result = tokio::select! {
-        result = signal::ctrl_c() => result,
-        result = terminate_signal() => result,
-    };
+    tokio::select! {
+        () = wait_for_signal("Ctrl+C", signal::ctrl_c()) => {}
+        () = wait_for_signal("SIGTERM", terminate_signal()) => {}
+    }
+    info!("Shutdown signal received");
+}
 
-    match result {
-        Ok(()) => info!("Shutdown signal received"),
-        Err(error) => error!(%error, "Failed to listen for a shutdown signal"),
+/// Waits for a shutdown signal. If the listener fails, it logs the error and
+/// never completes, so the other signal can still stop the server.
+async fn wait_for_signal(name: &'static str, signal: impl Future<Output = io::Result<()>>) {
+    if let Err(error) = signal.await {
+        error!(%error, signal = name, "Failed to listen for a shutdown signal");
+        std::future::pending::<()>().await;
     }
 }
 
@@ -89,4 +106,30 @@ async fn terminate_signal() -> io::Result<()> {
 #[cfg(not(unix))]
 async fn terminate_signal() -> io::Result<()> {
     std::future::pending().await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, time::Duration};
+
+    use tokio::time::timeout;
+
+    use super::wait_for_signal;
+
+    #[tokio::test]
+    async fn completes_when_the_signal_arrives() {
+        let result = timeout(
+            Duration::from_secs(1),
+            wait_for_signal("test", async { Ok(()) }),
+        )
+        .await;
+        assert!(result.is_ok(), "a received signal should start shutdown");
+    }
+
+    #[tokio::test]
+    async fn keeps_waiting_when_the_signal_listener_fails() {
+        let failing = async { Err(io::Error::other("registration failed")) };
+        let result = timeout(Duration::from_millis(50), wait_for_signal("test", failing)).await;
+        assert!(result.is_err(), "a failed listener must not start shutdown");
+    }
 }

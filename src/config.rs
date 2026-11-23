@@ -65,6 +65,26 @@ impl AppConfig {
         self.discord_webhook.as_ref()
     }
 
+    /// Describes configuration problems that do not stop startup but make some
+    /// requests fail. The messages never include secret values.
+    #[must_use]
+    pub fn startup_warnings(&self) -> Vec<&'static str> {
+        let mut warnings = Vec::new();
+        if is_blank(self.mineskin_api_key.as_deref()) {
+            warnings.push("MINESKIN_API_KEY is not set, so MineSkin requests will fail");
+        }
+        match self.aes_secret_key.as_deref() {
+            secret if is_blank(secret) => {
+                warnings.push("AES_SECRET_KEY is not set, so URL encryption will fail");
+            }
+            Some(secret) if secret.trim() != secret => warnings.push(
+                "AES_SECRET_KEY has leading or trailing whitespace, which is part of the derived key",
+            ),
+            _ => {}
+        }
+        warnings
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests(mineskin_base_url: Url) -> Self {
@@ -89,6 +109,10 @@ fn optional_environment_value(name: &'static str) -> Result<Option<String>, Conf
         Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(ConfigError::Environment(error)),
     }
+}
+
+fn is_blank(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim().is_empty())
 }
 
 /// Treats a blank value as unset, matching the other optional variables.
@@ -130,7 +154,50 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, parse_discord_webhook};
+    use url::Url;
+
+    use super::{AppConfig, ConfigError, parse_discord_webhook};
+
+    fn config_with_secrets(api_key: Option<&str>, aes_secret: Option<&str>) -> AppConfig {
+        let base_url = Url::parse("https://example.com/").expect("the test URL is valid");
+        let mut config = AppConfig::for_tests(base_url);
+        config.mineskin_api_key = api_key.map(str::to_owned);
+        config.aes_secret_key = aes_secret.map(str::to_owned);
+        config
+    }
+
+    #[test]
+    fn warns_about_missing_or_blank_secrets() {
+        for (api_key, aes_secret) in [(None, None), (Some(" "), Some(""))] {
+            let warnings = config_with_secrets(api_key, aes_secret).startup_warnings();
+            assert_eq!(
+                warnings,
+                [
+                    "MINESKIN_API_KEY is not set, so MineSkin requests will fail",
+                    "AES_SECRET_KEY is not set, so URL encryption will fail",
+                ],
+                "unexpected warnings for {api_key:?} and {aes_secret:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warns_about_padded_aes_secret() {
+        let warnings = config_with_secrets(Some("key"), Some(" hunter2\n")).startup_warnings();
+        assert_eq!(
+            warnings,
+            ["AES_SECRET_KEY has leading or trailing whitespace, which is part of the derived key"]
+        );
+    }
+
+    #[test]
+    fn has_no_warnings_for_configured_secrets() {
+        assert!(
+            config_with_secrets(Some("key"), Some("secret"))
+                .startup_warnings()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn treats_blank_discord_webhook_as_disabled() {
