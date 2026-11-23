@@ -11,7 +11,14 @@
     )
 )]
 
-use std::{env, error::Error, io, net::SocketAddr, process::ExitCode, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    io::{self, IsTerminal},
+    net::SocketAddr,
+    process::ExitCode,
+    sync::Arc,
+};
 
 use axolotl::{AppConfig, BUILD_COMMIT, Metrics, build_app, reporter::DiscordReporter};
 use tokio::{net::TcpListener, signal};
@@ -148,8 +155,10 @@ fn init_tracing() -> Result<(), Box<dyn Error + Send + Sync>> {
         ),
     };
 
+    // Container log drivers capture stdout as text, so only color a terminal.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(io::stdout().is_terminal())
         .try_init()?;
     if let Some(error) = invalid_filter {
         warn!(%error, "RUST_LOG is invalid, using the default log filter");

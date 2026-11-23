@@ -70,7 +70,9 @@ impl AppConfig {
     /// Reports whether `MINESKIN_API_KEY` has a value, without exposing it.
     #[must_use]
     pub fn has_mineskin_api_key(&self) -> bool {
-        !is_blank(self.mineskin_api_key.as_deref())
+        // Use the client's own check, so a key like "Bearer " counts as missing
+        // here just as it does in /ready and the startup warnings.
+        crate::mineskin::authorization_header(self.mineskin_api_key.as_deref()).is_some()
     }
 
     /// Reports whether `AES_SECRET_KEY` has a value, without exposing it.
@@ -263,11 +265,25 @@ mod tests {
     }
 
     #[test]
-    fn has_no_warnings_for_configured_secrets() {
+    fn reports_an_unusable_api_key_as_missing() {
+        for api_key in [None, Some(" "), Some("Bearer "), Some("bad\nkey")] {
+            assert!(
+                !config_with_secrets(api_key, Some("secret")).has_mineskin_api_key(),
+                "{api_key:?} cannot be sent, so it counts as missing"
+            );
+        }
         assert!(
-            config_with_secrets(Some("key"), Some("secret"))
-                .startup_warnings()
-                .is_empty()
+            config_with_secrets(Some("Bearer key"), Some("secret")).has_mineskin_api_key(),
+            "a usable key counts as present"
+        );
+    }
+
+    #[test]
+    fn has_no_warnings_for_configured_secrets() {
+        assert_eq!(
+            config_with_secrets(Some("key"), Some("secret")).startup_warnings(),
+            Vec::<&str>::new(),
+            "configured secrets should not warn"
         );
     }
 
