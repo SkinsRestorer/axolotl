@@ -36,8 +36,8 @@ Axolotl also loads variables from a local `.env` file when one exists.
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `MINESKIN_API_KEY` | For MineSkin routes | None | Authenticates outbound MineSkin requests. The `Bearer` prefix is optional. |
-| `AES_SECRET_KEY` | For encrypted URL routes | None | Derives the AES-256 key used for existing Axolotl URLs. Keep this value stable across deployments. |
-| `DISCORD_WEBHOOK` | No | Disabled | HTTPS Discord webhook that receives five-minute status reports. |
+| `AES_SECRET_KEY` | For MineSkin routes | None | Derives the AES-256 key that encrypts and decrypts Axolotl URLs. Every `/mineskin/*` route uses it. Keep this value stable across deployments. |
+| `DISCORD_WEBHOOK` | No | Disabled | Discord webhook URL that receives five-minute status reports. A blank value disables reports. Axolotl does not start if the value is not a valid HTTPS URL. |
 | `PORT` | No | `3000` | TCP port for the HTTP server. Railpack and Railway provide this automatically. |
 | `RUST_LOG` | No | `axolotl=info,tower_http=info` | Controls structured log filtering. |
 
@@ -63,6 +63,7 @@ Metrics advance only after Discord accepts a report. If delivery fails, the next
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| `GET` | `/` | Redirect to Swagger UI at `/swagger`. |
 | `GET` | `/health` | Report service health. |
 | `POST` | `/mineskin/skins` | Upload a skin and wait for its MineSkin job to complete. |
 | `GET` | `/mineskin/jobs/{jobId}` | Fetch and sanitize a MineSkin job. |
@@ -70,7 +71,9 @@ Metrics advance only after Discord accepts a report. If delivery fails, the next
 | `GET` | `/mineskin/cape-support` | Check the configured account's cape grant and list usable capes. |
 | `GET` | `/mineskin/decrypt-url` | Decrypt an Axolotl URL into its original `https://minesk.in/` URL. |
 
-Skin uploads accept up to 5 MiB. Axolotl processes up to 16 uploads at once and returns `503` when every upload slot is occupied. Upload bodies and complete upload workflows have deadlines, while MineSkin polling can run for at most five minutes and returns `504` if processing does not finish in time.
+Other paths return `404` with a JSON error body.
+
+Skin uploads accept up to 5 MiB. Axolotl processes up to 16 uploads at once and returns `503` when every upload slot is occupied. If the upload body does not arrive in time, Axolotl returns `408`. MineSkin polling runs for at most five minutes. If polling or the complete upload does not finish before its deadline, Axolotl returns `504`.
 
 New encrypted URLs use an authenticated `v2` payload. The decryption endpoint continues to accept URLs created by the legacy AES-CBC service.
 
@@ -89,8 +92,10 @@ Pushes to `main` build a release image with Railpack and publish it to
 - `main`: the latest published build from `main`
 - `sha-<12-character-commit-sha>`: the build for a specific commit
 
-The workflow uses the `ubuntu-24.04` runner and authenticates
-with `GITHUB_TOKEN`, with `packages: write` permission.
+The workflow builds `amd64` and `arm64` images on separate runners and combines them
+into one multi-architecture image. It authenticates with `GITHUB_TOKEN`, with
+`packages: write` permission. After it publishes the image, it starts a Dokploy
+deployment through a webhook.
 
 Put the required environment variables in a local `.env` file. Then run:
 

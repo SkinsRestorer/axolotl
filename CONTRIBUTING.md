@@ -19,10 +19,9 @@ Install [Lefthook](https://lefthook.dev/install/) 1.13.6 or newer, then run `lef
 The pre-commit hook checks staged whitespace and Rust formatting. The commit-msg hook checks the first line of each commit message for Conventional Commits.
 The pre-push hook runs Clippy on all targets and features when Rust files, Cargo files, the toolchain file, or `clippy.toml` change.
 Install cargo-deny 0.20.2 for the pre-push hook. It runs `cargo deny --locked check` when `Cargo.toml`, `Cargo.lock`, or `deny.toml` changes.
-The pre-push hook compares `HEAD` with the branch's upstream. Keep the upstream set to the branch that you push.
+The pre-push hook compares `HEAD` with the branch's upstream. If the branch has no upstream, the hook compares `HEAD` with `origin/main`. If `origin/main` is also missing, the hook checks every tracked file.
 
 Run the commands below from the repository root unless a command names another directory.
-On Windows, use `gradlew.bat` in place of `./gradlew` for Gradle commands.
 
 ## Repository layout
 
@@ -35,7 +34,7 @@ On Windows, use `gradlew.bat` in place of `./gradlew` for Gradle commands.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --locked
+cargo test --all-targets --all-features --locked
 ```
 
 Preserve existing encrypted URL compatibility. Cover upload limits, deadlines, error responses, and cancellation with focused tests. Use a test MineSkin account for live requests. Keep API keys and encryption secrets out of fixtures and logs.
