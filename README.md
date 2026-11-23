@@ -68,14 +68,16 @@ Metrics advance only after Discord accepts a report. If delivery fails, the next
 | `POST` | `/mineskin/skins` | Upload a skin and wait for its MineSkin job to complete. |
 | `GET` | `/mineskin/jobs/{jobId}` | Fetch and sanitize a MineSkin job. |
 | `GET` | `/mineskin/capes` | List supported capes. Results are cached for five minutes. |
-| `GET` | `/mineskin/cape-support` | Check the configured account's cape grant and list usable capes. |
-| `GET` | `/mineskin/decrypt-url` | Decrypt an Axolotl URL into its original `https://minesk.in/` URL. |
+| `GET` | `/mineskin/cape-support` | Check whether the configured account has a cape grant. List usable capes only when it has one. |
+| `GET` | `/mineskin/decrypt-url` | Decrypt an Axolotl URL into a `https://minesk.in/<skin-id>` URL. |
 
 Other paths return `404` with a JSON error body.
 
-Skin uploads accept up to 5 MiB. Axolotl processes up to 16 uploads at once and returns `503` when every upload slot is occupied. If the upload body does not arrive in time, Axolotl returns `408`. MineSkin polling runs for at most five minutes. If polling or the complete upload does not finish before its deadline, Axolotl returns `504`.
+Skin uploads accept up to 5 MiB and require a `capeUuid` from the supported cape list. The optional `waitMs` query parameter sets the interval between MineSkin job polls. It must be an integer from 250 to 10000, and the default is 1000. Other values return `400` with the message `waitMs must be an integer between 250 and 10000`. Axolotl processes up to 16 uploads at once and returns `503` when every upload slot is occupied. If the upload body does not arrive in time, Axolotl returns `408`. MineSkin polling runs for at most five minutes. If polling or the complete upload does not finish before its deadline, Axolotl returns `504`.
 
-New encrypted URLs use an authenticated `v2` payload. The decryption endpoint continues to accept URLs created by the legacy AES-CBC service.
+Axolotl caches the cape grant of the account for five minutes, the same time as the cape list.
+
+New encrypted URLs use an authenticated `v2` payload. The decryption endpoint continues to accept URLs created by the legacy AES-CBC service. Decrypted URLs always use the MineSkin skin ID: 32 hexadecimal digits without hyphens. MineSkin reads `minesk.in` links only up to the first character that is not a letter or digit, so a hyphenated ID does not work.
 
 ## Deploy with Railpack
 
@@ -85,8 +87,9 @@ Configure `MINESKIN_API_KEY` and `AES_SECRET_KEY` in the deployment environment,
 
 ## Run the published image
 
-Pushes to `main` build a release image with Railpack and publish it to
-`ghcr.io/skinsrestorer/axolotl`. Each build publishes three tags:
+After the "Build and test" workflow passes for a push to `main`, a second workflow
+builds a release image with Railpack and publishes it to
+`ghcr.io/skinsrestorer/axolotl`. It builds the commit that CI tested. Each build publishes three tags:
 
 - `latest`: the latest published build from `main`
 - `main`: the latest published build from `main`
@@ -115,9 +118,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 cargo build --release --locked
+cargo deny --locked check
 ```
 
-The tests include a fixed compatibility vector from the previous service. This protects existing encrypted URLs while the implementation remains in Rust.
+The last command needs cargo-deny 0.20.2. The tests include a fixed compatibility vector from the previous service. This protects existing encrypted URLs while the implementation remains in Rust.
 
 ## Contributing and support
 
