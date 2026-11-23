@@ -1,7 +1,7 @@
 # Contribute to axolotl
 
 Contributions can fix behavior, improve documentation, or add focused tests.
-The [README](README.md) documents runtime configuration. A release build uses `cargo build --release --locked`.
+The [README](README.md) documents the API and runtime configuration.
 
 ## Before you start
 
@@ -35,9 +35,13 @@ Run the commands below from the repository root unless a command names another d
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
+cargo build --release --locked
+cargo deny --locked check
 ```
 
-Preserve existing encrypted URL compatibility. Cover upload limits, deadlines, error responses, and cancellation with focused tests. Use a test MineSkin account for live requests. Keep API keys and encryption secrets out of fixtures and logs.
+These are the checks that CI runs. The last command needs cargo-deny 0.20.2.
+
+Keep existing encrypted URLs working. The tests include a fixed vector from the earlier service for this purpose. Cover upload limits, deadlines, error responses, and cancellation with focused tests. Use a test MineSkin account for live requests. Keep API keys and encryption secrets out of fixtures and logs.
 
 Run the relevant checks before review. State the command and result in the pull request.
 If a check cannot run, explain the missing dependency or service. Do not claim it passed.
@@ -53,7 +57,7 @@ Keep examples small and reproducible. Preserve exact identifiers, commands, and 
 ## Open a pull request
 
 Explain the problem and resulting behavior. Link related issues without a placeholder issue number.
-Describe API, configuration, or event behavior changes. State whether a live upstream or Discord check was required.
+Describe changes to the API, configuration, or Discord reports. State whether you tested against live MineSkin or Discord.
 Include commands and results. State any runtime checks that remain necessary.
 Respond to review with a correction or concrete evidence.
 

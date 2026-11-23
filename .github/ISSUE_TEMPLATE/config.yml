@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+- name: SkinsRestorer plugin issues
+  url: https://github.com/SkinsRestorer/SkinsRestorer/issues
+  about: Report problems with the SkinsRestorer plugin itself in its own repository.
 - name: SkinsRestorer Discord
   url: https://skinsrestorer.net/discord
   about: Read setup guidance or ask a usage question before opening a development

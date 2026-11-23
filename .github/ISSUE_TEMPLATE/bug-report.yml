@@ -3,8 +3,11 @@ description: Report a reproducible problem.
 body:
 - type: markdown
   attributes:
-    value: For setup questions, read [the support guide](https://github.com/SkinsRestorer/axolotl/blob/main/SUPPORT.md).
-      Remove secrets and private data from reports.
+    value: This form is for the Axolotl API service. Report SkinsRestorer plugin problems in
+      [the SkinsRestorer repository](https://github.com/SkinsRestorer/SkinsRestorer/issues).
+      For setup questions, read [the support guide](https://github.com/SkinsRestorer/axolotl/blob/main/SUPPORT.md).
+      Remove secrets and private data from reports. Report vulnerabilities privately as described in
+      [the security policy](https://github.com/SkinsRestorer/axolotl/blob/main/SECURITY.md).
 - type: checkboxes
   id: prior-search
   attributes:
@@ -24,11 +27,9 @@ body:
   attributes:
     label: Steps to reproduce
     description: Give the smallest reproducible example. Use synthetic data.
-    placeholder: '1. Prepare ...
+    placeholder: '1. Send POST /mineskin/skins with ...
 
-      2. Run or open ...
-
-      3. Observe ...'
+      2. Observe ...'
   validations:
     required: true
 - type: textarea
@@ -41,14 +42,15 @@ body:
 - type: textarea
   id: environment
   attributes:
-    label: Versions and environment
-    description: Service commit, Rust/runtime version, endpoint/method, response status, deployment type,
-      and redacted request/log details.
+    label: Version and deployment
+    description: The Axolotl commit or image tag, and the deployment (hosted service, Docker image, or
+      Railpack). Include the method, path, response status, and JSON error body.
   validations:
     required: true
 - type: textarea
   id: evidence
   attributes:
-    label: Logs, screenshots, or configuration
-    description: Include only relevant excerpts. Remove tokens, keys, cookies, personal data, and private
-      host details.
+    label: Logs or configuration
+    description: Include only relevant excerpts. Remove API keys, AES_SECRET_KEY, webhook URLs, personal
+      data, and private host details.
+    render: text

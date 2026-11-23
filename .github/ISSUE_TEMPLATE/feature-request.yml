@@ -35,4 +35,5 @@ body:
   id: compatibility
   attributes:
     label: Compatibility and context
-    description: Include affected versions, integrations, migration needs, and relevant references.
+    description: Say whether the change affects the API contract, encrypted URLs, or SkinsRestorer.
+      Include migration needs and relevant references.
