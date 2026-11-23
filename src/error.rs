@@ -43,20 +43,6 @@ impl ApiError {
     }
 }
 
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ApiError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &dyn std::error::Error)
-    }
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status.as_u16();
@@ -122,13 +108,5 @@ mod tests {
             body_json(response).await,
             serde_json::json!({ "error": "Failed to parse multipart form data" })
         );
-    }
-
-    #[test]
-    fn source_is_exposed_through_error_trait() {
-        let error = ApiError::internal("failed").with_source(std::io::Error::other("cause"));
-
-        let source = std::error::Error::source(&error).expect("source should be set");
-        assert_eq!(source.to_string(), "cause");
     }
 }

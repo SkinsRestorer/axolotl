@@ -12,7 +12,6 @@ use reqwest::{
     header::{AUTHORIZATION, HeaderValue},
     multipart::{Form, Part},
 };
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
@@ -37,7 +36,6 @@ use super::models::{
 
 const MINESKIN_USER_AGENT: &str = "Axolotl-MineSkin-Proxy/1.0";
 const MAXIMUM_UPSTREAM_RESPONSE_SIZE: usize = 1024 * 1024;
-const INITIAL_UPSTREAM_RESPONSE_CAPACITY: usize = 16 * 1024;
 const CAPE_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub struct MineSkinClient {
@@ -101,7 +99,6 @@ impl MineSkinClient {
             MineSkinClientError::unexpected("MineSkin job response", "job is missing")
         })?;
         let response = JobSuccessResponse {
-            success: true,
             job,
             skin: response.skin.take(),
             warnings: response.warnings.take(),
@@ -405,23 +402,7 @@ impl MineSkinClient {
         let result = async {
             let response = request.send().await.map_err(MineSkinClientError::Request)?;
             let status = response.status();
-            if response
-                .content_length()
-                .is_some_and(|length| length > MAXIMUM_UPSTREAM_RESPONSE_SIZE as u64)
-            {
-                return Err(MineSkinClientError::unexpected(
-                    context,
-                    "response exceeded 1 MiB",
-                ));
-            }
-
-            let capacity = response
-                .content_length()
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or_default()
-                .min(MAXIMUM_UPSTREAM_RESPONSE_SIZE)
-                .min(INITIAL_UPSTREAM_RESPONSE_CAPACITY);
-            let mut body = Vec::with_capacity(capacity);
+            let mut body = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(MineSkinClientError::Request)?;
@@ -444,8 +425,14 @@ impl MineSkinClient {
                 return Err(parse_error_response(context, &buffered));
             }
             let response = parse_response(context, &buffered)?;
+            if response.success == Some(false) {
+                return Err(MineSkinClientError::upstream(
+                    StatusCode::BAD_GATEWAY,
+                    response.into_error_message(),
+                ));
+            }
 
-            ensure_upstream_success(status, response)
+            Ok(response)
         }
         .await;
         let rate_limited = result
@@ -551,10 +538,10 @@ struct BufferedResponse {
     body: Vec<u8>,
 }
 
-fn parse_response<T: DeserializeOwned>(
+fn parse_response(
     context: &'static str,
     response: &BufferedResponse,
-) -> Result<T, MineSkinClientError> {
+) -> Result<MineSkinResponse, MineSkinClientError> {
     serde_json::from_slice(&response.body).map_err(|source| {
         error!(
             context,
@@ -589,25 +576,6 @@ fn parse_error_response(context: &'static str, response: &BufferedResponse) -> M
             )
         }
     }
-}
-
-fn ensure_upstream_success(
-    status: StatusCode,
-    response: MineSkinResponse,
-) -> Result<MineSkinResponse, MineSkinClientError> {
-    if status.is_success() && response.success != Some(false) {
-        return Ok(response);
-    }
-
-    let status = if status.is_success() {
-        StatusCode::BAD_GATEWAY
-    } else {
-        status
-    };
-    Err(MineSkinClientError::upstream(
-        status,
-        response.into_error_message(),
-    ))
 }
 
 fn normalize_texture_url(value: &str) -> Result<String, MineSkinClientError> {

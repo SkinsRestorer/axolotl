@@ -1,11 +1,8 @@
 #![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
-use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{self, IgnoredAny, MapAccess, Visitor},
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
@@ -43,7 +40,6 @@ pub enum JobStatus {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSuccessResponse {
-    pub success: bool,
     pub job: JobDetails,
     pub skin: Option<SkinResult>,
     pub warnings: Option<Vec<MineSkinErrorItem>>,
@@ -52,10 +48,6 @@ pub struct JobSuccessResponse {
 
 impl JobSuccessResponse {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !self.success {
-            return Err("success must be true");
-        }
-
         if matches!(self.skin, Some(SkinResult::Boolean(true))) {
             return Err("skin must be an object, false, or null");
         }
@@ -99,71 +91,15 @@ impl JobSuccessResponse {
     }
 }
 
-#[derive(Debug)]
+/// `MineSkin` sends either a skin object or a boolean in the `skin` field.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
 pub enum SkinResult {
     Skin(Skin),
     Boolean(bool),
 }
 
-impl<'de> Deserialize<'de> for SkinResult {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(SkinResultVisitor)
-    }
-}
-
-struct SkinResultVisitor;
-
-impl<'de> Visitor<'de> for SkinResultVisitor {
-    type Value = SkinResult;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a MineSkin skin object or boolean")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(SkinResult::Boolean(value))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut uuid = None;
-
-        while let Some(field) = map.next_key()? {
-            match field {
-                SkinField::Uuid => {
-                    if uuid.is_some() {
-                        return Err(de::Error::duplicate_field("uuid"));
-                    }
-                    uuid = Some(map.next_value()?);
-                }
-                SkinField::Other => {
-                    map.next_value::<IgnoredAny>()?;
-                }
-            }
-        }
-
-        let uuid = uuid.ok_or_else(|| de::Error::missing_field("uuid"))?;
-        Ok(SkinResult::Skin(Skin { uuid }))
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(field_identifier, rename_all = "camelCase")]
-enum SkinField {
-    Uuid,
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 pub struct Skin {
     pub uuid: String,
 }
