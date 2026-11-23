@@ -31,8 +31,8 @@ impl AppConfig {
     /// # Errors
     ///
     /// Returns an error when an environment variable is not valid Unicode, when
-    /// `PORT` is not a valid TCP port, or when an application URL cannot be
-    /// parsed.
+    /// `PORT` is not a valid TCP port, when an application URL cannot be
+    /// parsed, or when `DISCORD_WEBHOOK` does not use HTTPS.
     pub fn from_env() -> Result<Self, ConfigError> {
         let port = match env::var("PORT") {
             Ok(value) => parse_port(&value)?,
@@ -46,10 +46,7 @@ impl AppConfig {
                 .map_err(ConfigError::InvalidBaseUrl)?,
             mineskin_api_key: optional_environment_value("MINESKIN_API_KEY")?,
             aes_secret_key: optional_environment_value("AES_SECRET_KEY")?,
-            discord_webhook: optional_environment_value("DISCORD_WEBHOOK")?
-                .map(|value| Url::parse(&value))
-                .transpose()
-                .map_err(ConfigError::InvalidDiscordWebhook)?,
+            discord_webhook: parse_discord_webhook(optional_environment_value("DISCORD_WEBHOOK")?)?,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             default_poll_interval: DEFAULT_POLL_INTERVAL,
             max_poll_duration: DEFAULT_MAX_POLL_DURATION,
@@ -94,6 +91,18 @@ fn optional_environment_value(name: &'static str) -> Result<Option<String>, Conf
     }
 }
 
+/// Treats a blank value as unset, matching the other optional variables.
+fn parse_discord_webhook(value: Option<String>) -> Result<Option<Url>, ConfigError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let url = Url::parse(value.trim()).map_err(ConfigError::InvalidDiscordWebhook)?;
+    if url.scheme() != "https" {
+        return Err(ConfigError::InsecureDiscordWebhook);
+    }
+    Ok(Some(url))
+}
+
 fn parse_port(value: &str) -> Result<u16, ConfigError> {
     value.parse().map_err(|source| ConfigError::InvalidPort {
         value: value.to_owned(),
@@ -115,4 +124,45 @@ pub enum ConfigError {
     InvalidBaseUrl(#[source] url::ParseError),
     #[error("DISCORD_WEBHOOK must be a valid URL")]
     InvalidDiscordWebhook(#[source] url::ParseError),
+    #[error("DISCORD_WEBHOOK must use HTTPS")]
+    InsecureDiscordWebhook,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, parse_discord_webhook};
+
+    #[test]
+    fn treats_blank_discord_webhook_as_disabled() {
+        for value in [None, Some(String::new()), Some("  ".to_owned())] {
+            assert!(
+                matches!(parse_discord_webhook(value.clone()), Ok(None)),
+                "{value:?} should disable the reporter"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_only_https_discord_webhooks() {
+        let webhook = parse_discord_webhook(Some(
+            " https://discord.com/api/webhooks/1/token\n".to_owned(),
+        ));
+        assert!(
+            matches!(&webhook, Ok(Some(url)) if url.as_str() == "https://discord.com/api/webhooks/1/token"),
+            "a padded HTTPS webhook should be accepted: {webhook:?}"
+        );
+
+        let insecure =
+            parse_discord_webhook(Some("http://discord.com/api/webhooks/1/token".to_owned()));
+        assert!(
+            matches!(insecure, Err(ConfigError::InsecureDiscordWebhook)),
+            "an HTTP webhook should be rejected: {insecure:?}"
+        );
+
+        let invalid = parse_discord_webhook(Some("not a url".to_owned()));
+        assert!(
+            matches!(invalid, Err(ConfigError::InvalidDiscordWebhook(_))),
+            "an unparsable webhook should be rejected: {invalid:?}"
+        );
+    }
 }
