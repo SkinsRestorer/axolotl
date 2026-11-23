@@ -6,7 +6,7 @@ The service is a single Rust binary built with Axum and Tokio. It has no databas
 
 ## Requirements
 
-- Rust 1.95.0
+- The Rust version in `rust-toolchain.toml`
 - A MineSkin API key
 - A stable encryption secret
 
@@ -35,11 +35,15 @@ Axolotl also loads variables from a local `.env` file when one exists.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `MINESKIN_API_KEY` | For MineSkin routes | None | Authenticates outbound MineSkin requests. The `Bearer` prefix is optional. |
+| `MINESKIN_API_KEY` | For MineSkin routes | None | Authenticates outbound MineSkin requests. The `Bearer` prefix is optional and can use any letter case. |
 | `AES_SECRET_KEY` | For MineSkin routes | None | Derives the AES-256 key that encrypts and decrypts Axolotl URLs. Every `/mineskin/*` route uses it. Keep this value stable across deployments. |
 | `DISCORD_WEBHOOK` | No | Disabled | Discord webhook URL that receives five-minute status reports. A blank value disables reports. Axolotl does not start if the value is not a valid HTTPS URL. |
 | `PORT` | No | `3000` | TCP port for the HTTP server. Railpack and Railway provide this automatically. |
-| `RUST_LOG` | No | `axolotl=info,tower_http=info` | Controls structured log filtering. |
+| `RUST_LOG` | No | `axolotl=info` | Controls structured log filtering. |
+
+Axolotl does not start if a variable is not valid Unicode. The error names the variable but does not show its value.
+
+At startup, Axolotl logs a warning if `MINESKIN_API_KEY` or `AES_SECRET_KEY` is missing. It also logs a warning if `MINESKIN_API_KEY` is not a usable bearer token, for example the word `Bearer` alone or a key with control characters. The warnings never show the values.
 
 Missing route-specific credentials return a JSON configuration error. The health endpoint remains available without them.
 
@@ -73,7 +77,7 @@ Metrics advance only after Discord accepts a report. If delivery fails, the next
 
 Other paths return `404` with a JSON error body.
 
-Skin uploads accept up to 5 MiB and require a `capeUuid` from the supported cape list. The optional `waitMs` query parameter sets the interval between MineSkin job polls. It must be an integer from 250 to 10000, and the default is 1000. Other values return `400` with the message `waitMs must be an integer between 250 and 10000`. Axolotl processes up to 16 uploads at once and returns `503` when every upload slot is occupied. If the upload body does not arrive in time, Axolotl returns `408`. MineSkin polling runs for at most five minutes. If polling or the complete upload does not finish before its deadline, Axolotl returns `504`.
+Skin uploads require a `capeUuid` from the supported cape list. A skin file above 5 MiB or an upload body above 6 MiB returns `413`. The optional `name` field can have at most 48 characters. Each character must be a letter (`A-Z`, `a-z`), a digit, a space, a dot, a hyphen, or an underscore. Axolotl removes whitespace at the start and end before it checks the name. Other names return `400`, because MineSkin rejects them with a generic validation error. The optional `waitMs` query parameter sets the interval between MineSkin job polls. It must be an integer from 250 to 10000, and the default is 1000. Other values return `400` with the message `waitMs must be an integer between 250 and 10000`. Axolotl processes up to 16 uploads at once and returns `503` when every upload slot is occupied. If the upload body does not arrive in time, Axolotl returns `408`. If a job poll fails with a temporary error, such as a rate limit, Axolotl polls again later. Each error in a row doubles the wait, up to 10 seconds. After a successful poll, Axolotl uses the `waitMs` interval again. MineSkin polling runs for at most five minutes. If polling or the complete upload does not finish before its deadline, Axolotl returns `504`.
 
 Axolotl caches the cape grant of the account for five minutes, the same time as the cape list.
 
@@ -81,7 +85,7 @@ New encrypted URLs use an authenticated `v2` payload. The decryption endpoint co
 
 ## Deploy with Railpack
 
-[Railpack](https://railpack.com/languages/rust) detects the root `Cargo.toml`, selects Rust 1.95.0 from `rust-toolchain.toml`, builds the release binary, and starts `./bin/axolotl`. No custom build or start command is required.
+[Railpack](https://railpack.com/languages/rust) detects the root `Cargo.toml`, selects the Rust version from `rust-toolchain.toml`, builds the release binary, and starts `./bin/axolotl`. No custom build or start command is required.
 
 Configure `MINESKIN_API_KEY` and `AES_SECRET_KEY` in the deployment environment, then deploy the repository. On Railway, Axolotl listens on the injected `PORT` and exposes `/health` for deployment health checks.
 
