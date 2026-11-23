@@ -5,13 +5,18 @@
     ":semanticCommits",
     "helpers:pinGitHubActionDigests"
   ],
-  "enabledManagers": ["cargo", "github-actions"],
+  "enabledManagers": ["cargo", "github-actions", "rust-toolchain"],
   "packageRules": [
     {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "automerge": true,
       "automergeType": "branch",
       "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Major updates get a pull request. The renovate/major/ prefix keeps the push triggers of the workflows from testing them a second time.",
+      "matchUpdateTypes": ["major"],
+      "additionalBranchPrefix": "major/"
     },
     {
       "matchPackageNames": ["**"],

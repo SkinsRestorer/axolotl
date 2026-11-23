@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - "renovate/**"
+      # Major updates are checked through their pull request.
+      - "!renovate/major/**"
   pull_request:
     branches:
       - main

@@ -2,12 +2,14 @@ name: Build and test
 
 on:
   # Other branches are checked through their pull request, so same-repo PRs
-  # don't run twice. Renovate automerges branches without a PR, so its
-  # branches keep a push trigger.
+  # don't run twice. Renovate automerges non-major branches without a PR, so
+  # those branches keep a push trigger. Major updates always get a PR, and
+  # renovate.json puts them under renovate/major/.
   push:
     branches:
       - main
       - "renovate/**"
+      - "!renovate/major/**"
   pull_request:
 
 permissions:
@@ -28,10 +30,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # Rustup reads the version and components from rust-toolchain.toml,
+      # which Renovate updates.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
-        with:
-          components: clippy,rustfmt
+        run: |
+          rustup toolchain install
+          rustc --version
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
