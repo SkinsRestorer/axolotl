@@ -29,10 +29,7 @@ const MAX_TRACKED_CLIENTS: usize = 100_000;
 #[derive(Debug)]
 pub struct Metrics {
     requests: AtomicU64,
-    successful_responses: AtomicU64,
-    redirects: AtomicU64,
-    client_errors: AtomicU64,
-    server_errors: AtomicU64,
+    statuses: StatusCounters,
     job_requests: AtomicU64,
     cape_requests: AtomicU64,
     health_requests: AtomicU64,
@@ -54,10 +51,7 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             requests: AtomicU64::new(0),
-            successful_responses: AtomicU64::new(0),
-            redirects: AtomicU64::new(0),
-            client_errors: AtomicU64::new(0),
-            server_errors: AtomicU64::new(0),
+            statuses: StatusCounters::default(),
             job_requests: AtomicU64::new(0),
             cape_requests: AtomicU64::new(0),
             health_requests: AtomicU64::new(0),
@@ -92,21 +86,7 @@ impl Metrics {
         let mut client_requests = self.lock_client_requests();
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.request_latency.record(latency);
-
-        match status {
-            200..=299 => {
-                self.successful_responses.fetch_add(1, Ordering::Relaxed);
-            }
-            300..=399 => {
-                self.redirects.fetch_add(1, Ordering::Relaxed);
-            }
-            400..=499 => {
-                self.client_errors.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {
-                self.server_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        self.statuses.record(status);
 
         self.record_endpoint(path, status, latency);
 
@@ -127,16 +107,13 @@ impl Metrics {
         }
     }
 
-    pub fn begin_mineskin_request(&self) {
-        self.mineskin_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn record_mineskin_response_bytes(&self, bytes: usize) {
         self.bytes_received_from_mineskin
             .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     pub fn finish_mineskin_request(&self, latency: Duration, failed: bool, rate_limited: bool) {
+        self.mineskin_requests.fetch_add(1, Ordering::Relaxed);
         self.mineskin_latency.record(latency);
         if failed {
             self.mineskin_errors.fetch_add(1, Ordering::Relaxed);
@@ -151,10 +128,10 @@ impl Metrics {
         let client_requests = self.lock_client_requests();
         MetricsSnapshot {
             requests: self.requests.load(Ordering::Relaxed),
-            successful_responses: self.successful_responses.load(Ordering::Relaxed),
-            redirects: self.redirects.load(Ordering::Relaxed),
-            client_errors: self.client_errors.load(Ordering::Relaxed),
-            server_errors: self.server_errors.load(Ordering::Relaxed),
+            successful_responses: self.statuses.successful_responses.load(Ordering::Relaxed),
+            redirects: self.statuses.redirects.load(Ordering::Relaxed),
+            client_errors: self.statuses.client_errors.load(Ordering::Relaxed),
+            server_errors: self.statuses.server_errors.load(Ordering::Relaxed),
             job_requests: self.job_requests.load(Ordering::Relaxed),
             cape_requests: self.cape_requests.load(Ordering::Relaxed),
             health_requests: self.health_requests.load(Ordering::Relaxed),
@@ -317,6 +294,7 @@ impl LatencySnapshot {
 pub(crate) struct EndpointSnapshot {
     pub(crate) requests: u64,
     pub(crate) successful_responses: u64,
+    pub(crate) redirects: u64,
     pub(crate) client_errors: u64,
     pub(crate) server_errors: u64,
     pub(crate) latency: LatencySnapshot,
@@ -330,6 +308,7 @@ impl EndpointSnapshot {
             successful_responses: self
                 .successful_responses
                 .saturating_sub(previous.successful_responses),
+            redirects: self.redirects.saturating_sub(previous.redirects),
             client_errors: self.client_errors.saturating_sub(previous.client_errors),
             server_errors: self.server_errors.saturating_sub(previous.server_errors),
             latency: self.latency.since(&previous.latency),
@@ -409,9 +388,7 @@ impl MetricsSnapshot {
 #[derive(Debug, Default)]
 struct EndpointMetrics {
     requests: AtomicU64,
-    successful_responses: AtomicU64,
-    client_errors: AtomicU64,
-    server_errors: AtomicU64,
+    statuses: StatusCounters,
     latency: LatencyHistogram,
 }
 
@@ -419,28 +396,43 @@ impl EndpointMetrics {
     fn record(&self, status: u16, latency: Duration) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.latency.record(latency);
-        match status {
-            200..=399 => {
-                self.successful_responses.fetch_add(1, Ordering::Relaxed);
-            }
-            400..=499 => {
-                self.client_errors.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {
-                self.server_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        self.statuses.record(status);
     }
 
     fn snapshot(&self, client_requests: HashMap<IpAddr, u64>) -> EndpointSnapshot {
         EndpointSnapshot {
             requests: self.requests.load(Ordering::Relaxed),
-            successful_responses: self.successful_responses.load(Ordering::Relaxed),
-            client_errors: self.client_errors.load(Ordering::Relaxed),
-            server_errors: self.server_errors.load(Ordering::Relaxed),
+            successful_responses: self.statuses.successful_responses.load(Ordering::Relaxed),
+            redirects: self.statuses.redirects.load(Ordering::Relaxed),
+            client_errors: self.statuses.client_errors.load(Ordering::Relaxed),
+            server_errors: self.statuses.server_errors.load(Ordering::Relaxed),
             latency: self.latency.snapshot(),
             client_requests,
         }
+    }
+}
+
+/// Counts responses by status class. The global traffic counters and the
+/// per-endpoint counters share it so their sections in a report agree.
+#[derive(Debug, Default)]
+struct StatusCounters {
+    successful_responses: AtomicU64,
+    redirects: AtomicU64,
+    client_errors: AtomicU64,
+    server_errors: AtomicU64,
+}
+
+impl StatusCounters {
+    fn record(&self, status: u16) {
+        let counter = match status {
+            // Informational responses such as 101 Switching Protocols are final
+            // responses that did not fail.
+            100..=299 => &self.successful_responses,
+            300..=399 => &self.redirects,
+            400..=499 => &self.client_errors,
+            _ => &self.server_errors,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -552,5 +544,51 @@ mod tests {
             after_acknowledgement.decrypt.client_requests.get(&client),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn counts_a_mineskin_call_in_the_window_where_it_finishes() {
+        let metrics = Metrics::default();
+        let baseline = metrics.snapshot();
+        let first_report = metrics.snapshot();
+        let first_window = first_report.since(&baseline, Duration::from_mins(5));
+        assert_eq!(first_window.mineskin_requests, 0);
+        assert_eq!(first_window.mineskin_errors, 0);
+
+        metrics.finish_mineskin_request(Duration::from_secs(2), true, true);
+        metrics.finish_mineskin_request(Duration::from_secs(3), true, false);
+        let second_window = metrics
+            .snapshot()
+            .since(&first_report, Duration::from_mins(5));
+        assert_eq!(second_window.mineskin_requests, 2);
+        assert_eq!(second_window.mineskin_errors, 2);
+        assert_eq!(second_window.mineskin_rate_limits, 1);
+        assert_eq!(second_window.mineskin_latency.count(), 2);
+    }
+
+    #[test]
+    fn classifies_endpoint_statuses_like_global_traffic() {
+        let metrics = Metrics::default();
+        for status in [101, 200, 302, 404, 503] {
+            metrics.record_request("/mineskin/skins", status, None, Duration::from_millis(5));
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.successful_responses, 2);
+        assert_eq!(snapshot.redirects, 1);
+        assert_eq!(snapshot.client_errors, 1);
+        assert_eq!(snapshot.server_errors, 1);
+
+        let upload = &snapshot.upload;
+        assert_eq!(upload.requests, 5);
+        assert_eq!(upload.successful_responses, snapshot.successful_responses);
+        assert_eq!(upload.redirects, snapshot.redirects);
+        assert_eq!(upload.client_errors, snapshot.client_errors);
+        assert_eq!(upload.server_errors, snapshot.server_errors);
+
+        let window = metrics
+            .snapshot()
+            .since(&Metrics::default().snapshot(), Duration::from_mins(5));
+        assert_eq!(window.upload.redirects, 1);
     }
 }
