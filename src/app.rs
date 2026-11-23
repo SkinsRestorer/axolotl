@@ -5,12 +5,9 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Router,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{
-        HeaderValue, Method, StatusCode,
-        header::{CONTENT_TYPE, LOCATION},
-    },
+    http::{HeaderValue, Method, StatusCode, header::LOCATION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -51,11 +48,7 @@ pub(crate) struct AppState {
 
 #[derive(OpenApi)]
 #[openapi(
-    info(
-        title = "Axolotl",
-        version = "1.0.0",
-        description = "A lightweight MineSkin proxy API"
-    ),
+    info(title = "Axolotl", description = "A lightweight MineSkin proxy API"),
     paths(
         health,
         upload_skin,
@@ -66,11 +59,11 @@ pub(crate) struct AppState {
     ),
     components(schemas(HealthResponse, UploadRequest, DecryptedUrlResponse, ErrorResponse)),
     tags(
-        (name = "health", description = "Health check endpoint"),
         (
             name = "mineskin",
             description = "MineSkin proxy endpoints that inject the configured API key."
-        )
+        ),
+        (name = "health", description = "Health check endpoint")
     )
 )]
 struct ApiDoc;
@@ -212,26 +205,16 @@ pub fn api_document(port: u16) -> OpenApiDocument {
 async fn root() -> impl IntoResponse {
     (
         StatusCode::FOUND,
-        [(LOCATION, HeaderValue::from_static("/swagger"))],
+        [(LOCATION, HeaderValue::from_static("/swagger/"))],
     )
 }
 
-async fn not_found() -> impl IntoResponse {
-    json_error(StatusCode::NOT_FOUND, "Not Found")
+async fn not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "Not Found")
 }
 
-async fn method_not_allowed() -> impl IntoResponse {
-    json_error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
-}
-
-fn json_error(status: StatusCode, error: &str) -> impl IntoResponse {
-    (
-        status,
-        [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
-        Json(ErrorResponse {
-            error: error.to_owned(),
-        }),
-    )
+async fn method_not_allowed() -> ApiError {
+    ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
 }
 
 #[cfg(test)]

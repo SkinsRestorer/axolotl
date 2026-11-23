@@ -452,10 +452,7 @@ async fn rejects_invalid_decrypt_url_requests_with_json_errors() -> TestResult {
             .finish()
     };
     for (query, expected_error) in [
-        (
-            String::new(),
-            "Failed to deserialize query string: missing field `encryptedUrl`",
-        ),
+        (String::new(), "encryptedUrl is required"),
         (
             encoded("https://minesk.in/123e4567-e89b-12d3-a456-426614174000"),
             "Invalid encrypted URL format",
@@ -1075,6 +1072,20 @@ async fn hides_transport_error_details_from_clients() -> TestResult {
     assert_eq!(
         json_body(response).await?,
         json!({ "error": "MineSkin request failed" })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn redirects_the_root_straight_to_the_swagger_ui() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+
+    let response = send(&app, Request::get("/").body(Body::empty())?).await?;
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response.headers().get(header::LOCATION),
+        Some(&header::HeaderValue::from_static("/swagger/"))
     );
     Ok(())
 }

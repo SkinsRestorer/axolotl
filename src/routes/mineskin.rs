@@ -81,7 +81,7 @@ pub struct DecryptedUrlResponse {
     post,
     path = "/mineskin/skins",
     tag = "mineskin",
-    description = "Upload a skin to MineSkin with a required cape and wait for completion.",
+    summary = "Upload a skin to MineSkin with a required cape and wait for completion.",
     params(
         (
             "waitMs" = Option<u64>,
@@ -111,10 +111,10 @@ pub async fn upload_skin(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<SanitizedResponse>, ApiError> {
     let Query(query) = query.map_err(|error| ApiError::bad_request(error.body_text()))?;
-    let poll_interval = validate_poll_interval(query.wait_ms.map_or_else(
-        || state.mineskin.default_poll_interval(),
-        Duration::from_millis,
-    ))?;
+    let poll_interval = match query.wait_ms {
+        Some(wait_ms) => validate_poll_interval(wait_ms)?,
+        None => state.mineskin.default_poll_interval(),
+    };
     let upload = timeout(
         state.upload_body_timeout,
         parse_upload(multipart.map_err(|error| {
@@ -156,7 +156,7 @@ pub async fn upload_skin(
     get,
     path = "/mineskin/jobs/{jobId}",
     tag = "mineskin",
-    description = "Retrieve the status of a MineSkin job.",
+    summary = "Retrieve the status of a MineSkin job.",
     params(
         (
             "jobId" = String,
@@ -201,7 +201,7 @@ pub async fn job_status(
     get,
     path = "/mineskin/capes",
     tag = "mineskin",
-    description = "List MineSkin capes supported by the proxy.",
+    summary = "List MineSkin capes supported by the proxy.",
     responses(
         (status = 200, description = "List of supported capes.", body = CapesResponse),
         (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
@@ -225,7 +225,7 @@ pub async fn supported_capes(
     get,
     path = "/mineskin/cape-support",
     tag = "mineskin",
-    description = "Check whether the configured MineSkin account has cape grants and list supported capes.",
+    summary = "Check whether the configured MineSkin account has cape grants and list supported capes.",
     responses(
         (status = 200, description = "Cape support information.", body = CapeSupportResponse),
         (status = 429, description = "MineSkin rate limit exceeded.", body = ErrorResponse),
@@ -253,7 +253,7 @@ pub async fn cape_support(
     get,
     path = "/mineskin/decrypt-url",
     tag = "mineskin",
-    description = "Decrypt an encrypted MineSkin URL back to the original URL.",
+    summary = "Decrypt an encrypted MineSkin URL back to the original URL.",
     params(
         ("encryptedUrl" = String, Query, description = "The encrypted URL to decrypt.")
     ),
@@ -267,7 +267,8 @@ pub async fn decrypt_url(
     State(state): State<Arc<AppState>>,
     query: Result<Query<DecryptUrlQuery>, QueryRejection>,
 ) -> Result<Json<DecryptedUrlResponse>, ApiError> {
-    let Query(query) = query.map_err(|error| ApiError::bad_request(error.body_text()))?;
+    let Query(query) = query
+        .map_err(|error| ApiError::bad_request("encryptedUrl is required").with_source(error))?;
     let url = state
         .cipher
         .decrypt_url(&query.encrypted_url)
@@ -288,7 +289,6 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
     let mut file = None;
     let mut variant = None;
     let mut name = None;
-    let mut name_was_present = false;
     let mut cape_uuid = None;
     let mut cape_alias = None;
 
@@ -310,8 +310,7 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
             "variant" if variant.is_none() => {
                 variant = Some(read_text_field(field).await?);
             }
-            "name" if !name_was_present => {
-                name_was_present = true;
+            "name" if name.is_none() => {
                 name = Some(read_text_field(field).await?);
             }
             "capeUuid" if cape_uuid.is_none() => {
@@ -329,9 +328,12 @@ async fn parse_upload(mut multipart: Multipart) -> Result<UploadPayload, ApiErro
     let variant = variant
         .filter(|value| matches!(value.as_str(), "classic" | "slim"))
         .ok_or_else(|| ApiError::bad_request("variant must be one of classic or slim"))?;
-    let name = name
-        .map(|value| value.trim().to_owned())
-        .transpose_non_empty("name must contain at least 1 character")?;
+    let name = name.map(|value| value.trim().to_owned());
+    if name.as_ref().is_some_and(String::is_empty) {
+        return Err(ApiError::bad_request(
+            "name must contain at least 1 character",
+        ));
+    }
     if name
         .as_ref()
         .is_some_and(|value| value.encode_utf16().count() > 64)
@@ -384,15 +386,14 @@ fn is_valid_job_id(job_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn validate_poll_interval(interval: Duration) -> Result<Duration, ApiError> {
-    let milliseconds = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+fn validate_poll_interval(milliseconds: u64) -> Result<Duration, ApiError> {
     if !(MINIMUM_POLL_INTERVAL_MS..=MAXIMUM_POLL_INTERVAL_MS).contains(&milliseconds) {
         return Err(ApiError::bad_request(
             "waitMs must be between 250 and 10000",
         ));
     }
 
-    Ok(interval)
+    Ok(Duration::from_millis(milliseconds))
 }
 
 fn map_upload_error(error: &MineSkinClientError) -> ApiError {
@@ -462,17 +463,4 @@ fn mineskin_error(error: &MineSkinClientError, status: StatusCode, context: &str
     };
 
     ApiError::new(status, message)
-}
-
-trait OptionalStringExt {
-    fn transpose_non_empty(self, empty_message: &'static str) -> Result<Option<String>, ApiError>;
-}
-
-impl OptionalStringExt for Option<String> {
-    fn transpose_non_empty(self, empty_message: &'static str) -> Result<Option<String>, ApiError> {
-        match self {
-            Some(value) if value.is_empty() => Err(ApiError::bad_request(empty_message)),
-            value => Ok(value),
-        }
-    }
 }

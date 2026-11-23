@@ -12,7 +12,7 @@ pub struct HealthResponse {
     get,
     path = "/health",
     tag = "health",
-    description = "Health check endpoint",
+    summary = "Check that the service is running.",
     responses(
         (status = 200, description = "Successful response", body = HealthResponse)
     )
