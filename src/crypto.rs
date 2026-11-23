@@ -83,11 +83,13 @@ impl UrlCipher {
             return Err(CryptoError::InvalidPayload);
         }
 
-        let uuid = if let Some(payload) = payload.strip_prefix(AUTHENTICATED_PAYLOAD_PREFIX) {
-            Self::decrypt_authenticated_uuid(key, payload)?
-        } else {
-            Self::decrypt_legacy_uuid(key, payload)?
-        };
+        // "v2/" is also valid standard base64, so a legacy payload whose random
+        // IV encodes to it must still decrypt as legacy.
+        let uuid = payload
+            .strip_prefix(AUTHENTICATED_PAYLOAD_PREFIX)
+            .ok_or(CryptoError::InvalidPayload)
+            .and_then(|payload| Self::decrypt_authenticated_uuid(key, payload))
+            .or_else(|_| Self::decrypt_legacy_uuid(key, payload))?;
         let uuid = canonical_uuid(&uuid).map_err(|_| CryptoError::InvalidPayload)?;
 
         Ok(format!("{MINESKIN_URL_PREFIX}{uuid}"))
@@ -373,6 +375,27 @@ mod tests {
         let decrypted = cipher.decrypt_url(&encrypted.replace('+', " "))?;
 
         assert_eq!(decrypted, format!("{MINESKIN_URL_PREFIX}{SKIN_ID}"));
+        Ok(())
+    }
+
+    #[test]
+    fn decrypts_legacy_payloads_that_start_with_the_v2_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cipher = UrlCipher::new(Some("test-secret"));
+        let mut iv = [0; 16];
+        iv[..3].copy_from_slice(&STANDARD.decode("v2/A")?);
+        let encrypted = cipher.encrypt_uuid_with_iv(UUID, iv)?;
+        assert!(
+            encrypted.starts_with(&format!(
+                "{ENCRYPTED_URL_SCHEME}{AUTHENTICATED_PAYLOAD_PREFIX}"
+            )),
+            "test vector must start with the v2 prefix"
+        );
+
+        assert_eq!(
+            cipher.decrypt_url(&encrypted)?,
+            format!("{MINESKIN_URL_PREFIX}{SKIN_ID}")
+        );
         Ok(())
     }
 
