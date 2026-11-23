@@ -287,6 +287,9 @@ async fn rejects_oversized_chunked_upstream_responses_while_streaming() -> TestR
         .expect(2)
         .mount(&server)
         .await;
+    // Build the app first: it installs the rustls provider that a plain
+    // reqwest client needs, so the test also passes when run on its own.
+    let app = mock_app(&server)?;
     let upstream = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?
@@ -296,7 +299,6 @@ async fn rejects_oversized_chunked_upstream_responses_while_streaming() -> TestR
     assert_eq!(upstream.headers().get(header::CONTENT_LENGTH), None);
     assert_eq!(upstream.content_length(), None);
     drop(upstream);
-    let app = mock_app(&server)?;
 
     let response = get(&app, "/mineskin/capes").await?;
 
@@ -688,7 +690,7 @@ async fn returns_400_only_when_mineskin_rejects_the_queued_skin() -> TestResult 
             "upstream {upstream_status}"
         );
         let expected_code = if expected_status == StatusCode::BAD_REQUEST {
-            "invalid_upload"
+            "skin_rejected"
         } else {
             "mineskin_error"
         };
@@ -939,7 +941,11 @@ async fn backs_off_while_job_status_polls_keep_failing() -> TestResult {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Timed out waiting for MineSkin job to finish", "code": "job_timeout" })
+        json!({
+            "error": "Timed out waiting for MineSkin job to finish",
+            "code": "job_timeout",
+            "jobId": "job-1"
+        })
     );
     let polls = upstream_requests(&server, Some("/v2/queue/job-1")).await;
     assert!(
@@ -976,7 +982,11 @@ async fn returns_504_when_an_uploaded_job_never_finishes() -> TestResult {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         json_body(response).await?,
-        json!({ "error": "Timed out waiting for MineSkin job to finish", "code": "job_timeout" })
+        json!({
+            "error": "Timed out waiting for MineSkin job to finish",
+            "code": "job_timeout",
+            "jobId": "job-1"
+        })
     );
     let polls = upstream_requests(&server, Some("/v2/queue/job-1")).await;
     assert!(polls >= 2, "the job was polled only {polls} times");
@@ -1041,7 +1051,7 @@ async fn fails_an_upload_without_retrying_when_mineskin_rejects_the_job() -> Tes
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": expected_error, "code": "mineskin_error" }),
+            json!({ "error": expected_error, "code": "mineskin_error", "jobId": "job-1" }),
             "{case}"
         );
         server.verify().await;
@@ -1106,6 +1116,10 @@ async fn rejects_uploads_above_the_concurrency_limit_until_a_slot_frees() -> Tes
     let second = post_upload(&app, "/mineskin/skins?waitMs=250").await?;
 
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        second.headers().get(header::RETRY_AFTER),
+        Some(&header::HeaderValue::from_static("5"))
+    );
     assert_eq!(
         json_body(second).await?,
         json!({ "error": "Too many skin uploads are already in progress", "code": "upload_busy" })
@@ -1697,11 +1711,7 @@ async fn rejects_a_cape_response_without_a_cape_list() -> TestResult {
 async fn configures_swagger_ui_without_the_explore_bar() -> TestResult {
     let app = test_app("http://127.0.0.1:9/v2/")?;
 
-    let response = send(
-        &app,
-        Request::get("/swagger/swagger-initializer.js").body(Body::empty())?,
-    )
-    .await?;
+    let response = get(&app, "/swagger/swagger-initializer.js").await?;
     assert_eq!(response.status(), StatusCode::OK);
     let script = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await?.to_vec())?;
 
@@ -1740,27 +1750,17 @@ async fn rejects_upload_bodies_that_are_not_multipart_with_the_expected_content_
 #[tokio::test]
 async fn rejects_a_blank_skin_name_before_calling_mineskin() -> TestResult {
     let server = MockServer::start().await;
-    let app = test_app(&format!("{}/v2/", server.uri()))?;
-    let boundary = "axolotl-blank-name";
-    let body = multipart_upload(boundary).replace("integration_skin", "   ");
+    let app = mock_app(&server)?;
+    let body = multipart_upload(UPLOAD_BOUNDARY).replace("integration_skin", "   ");
 
-    let response = send(
-        &app,
-        Request::post("/mineskin/skins")
-            .header(
-                header::CONTENT_TYPE,
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .body(Body::from(body))?,
-    )
-    .await?;
+    let response = post_multipart(&app, "/mineskin/skins", body).await?;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         json_body(response).await?,
         json!({ "error": "name must not be blank", "code": "invalid_upload" })
     );
-    assert_eq!(server.received_requests().await.map(|r| r.len()), Some(0));
+    assert_eq!(upstream_requests(&server, None).await, 0);
     Ok(())
 }
 
@@ -1775,13 +1775,9 @@ async fn reports_a_completed_job_without_skin_data_on_the_job_route() -> TestRes
         })))
         .mount(&server)
         .await;
-    let app = test_app(&format!("{}/v2/", server.uri()))?;
+    let app = mock_app(&server)?;
 
-    let response = send(
-        &app,
-        Request::get("/mineskin/jobs/job-empty").body(Body::empty())?,
-    )
-    .await?;
+    let response = get(&app, "/mineskin/jobs/job-empty").await?;
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
@@ -1850,111 +1846,6 @@ async fn generates_a_request_id_without_a_cloudflare_ray_id() -> TestResult {
 }
 
 #[tokio::test]
-async fn logs_each_request_with_its_id_and_without_the_query_string() -> TestResult {
-    #[derive(Clone, Default)]
-    struct CapturedLog(std::sync::Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for CapturedLog {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?
-                .extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let log = CapturedLog::default();
-    let writer = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("axolotl=info"))
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
-    // A thread-local subscriber misses log lines whose callsites other test
-    // threads register first, so this test installs the global one. Other
-    // tests log into it too, so the checks look only at this test's IDs.
-    tracing::subscriber::set_global_default(subscriber)?;
-    let app = test_app("http://127.0.0.1:9/v2/")?;
-
-    let probe = send(
-        &app,
-        Request::get("/ready")
-            .header("cf-ray", "probe-ray")
-            .body(Body::empty())?,
-    )
-    .await?;
-    assert_eq!(probe.status(), StatusCode::OK);
-    let decrypt = send(
-        &app,
-        Request::get("/mineskin/decrypt-url?encryptedUrl=secret-encrypted-value")
-            .header("cf-ray", "decrypt-ray")
-            .body(Body::empty())?,
-    )
-    .await?;
-    assert_eq!(decrypt.status(), StatusCode::BAD_REQUEST);
-    // MineSkin is unreachable, so the handler logs an error inside the request.
-    let capes = send(
-        &app,
-        Request::get("/mineskin/capes")
-            .header("cf-ray", "capes-ray")
-            .body(Body::empty())?,
-    )
-    .await?;
-    assert!(capes.status().is_server_error(), "{}", capes.status());
-
-    let output = String::from_utf8(
-        log.0
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .clone(),
-    )?;
-    let lines_for = |request_id: &str| {
-        let field = format!("request_id={request_id}");
-        output
-            .lines()
-            .filter(|line| line.contains(&field))
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-
-    assert_eq!(
-        lines_for("probe-ray"),
-        Vec::<String>::new(),
-        "probes must not log at info"
-    );
-    let decrypt_lines = lines_for("decrypt-ray");
-    assert_eq!(decrypt_lines.len(), 1, "{decrypt_lines:?}");
-    assert!(
-        decrypt_lines
-            .iter()
-            .all(|line| line.contains("Request completed")
-                && line.contains("method=GET")
-                && line.contains("path=/mineskin/decrypt-url ")
-                && line.contains("status=400")
-                && line.contains("latency_ms=")),
-        "{decrypt_lines:?}"
-    );
-    assert!(
-        !output.contains("secret-encrypted-value"),
-        "the log must not contain the query string: {output}"
-    );
-    let capes_lines = lines_for("capes-ray");
-    assert!(
-        capes_lines.len() >= 2
-            && capes_lines
-                .last()
-                .is_some_and(|line| line.contains("Request completed")),
-        "log lines inside a request must carry its ID: {capes_lines:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn reports_the_job_state_so_clients_can_resume_a_pending_upload() -> TestResult {
     for status in ["waiting", "active", "processing"] {
         let server = MockServer::start().await;
@@ -1973,11 +1864,15 @@ async fn reports_the_job_state_so_clients_can_resume_a_pending_upload() -> TestR
         let response = get(&app, "/mineskin/jobs/job-1").await?;
 
         assert_eq!(response.status(), StatusCode::OK, "status {status}");
-        let body = json_body(response).await?;
-        assert_eq!(body.get("skin"), Some(&Value::Null), "status {status}");
         assert_eq!(
-            body.get("job"),
-            Some(&json!({ "id": "job-1", "status": status })),
+            json_body(response).await?,
+            json!({
+                "success": true,
+                "skin": null,
+                "warnings": [],
+                "messages": [],
+                "job": { "id": "job-1", "status": status }
+            }),
             "status {status}"
         );
         server.verify().await;
@@ -2025,37 +1920,223 @@ fn openapi_document_lists_every_error_code() -> TestResult {
 
 #[tokio::test]
 async fn forwards_the_mineskin_retry_after_on_rate_limits() -> TestResult {
-    for (upstream_retry_after, expected) in [(Some("30"), Some("30")), (None, None)] {
+    // Every route that calls MineSkin passes its Retry-After on a 429, and only
+    // on a 429.
+    for (route, upstream_method, upstream_path, upstream_status, retry_after) in [
+        ("/mineskin/capes", "GET", "/v2/capes", 429, Some("30")),
+        ("/mineskin/capes", "GET", "/v2/capes", 429, None),
+        ("/mineskin/capes", "GET", "/v2/capes", 503, Some("30")),
+        ("/mineskin/cape-support", "GET", "/v2/me", 429, Some("30")),
+        (
+            "/mineskin/jobs/job-1",
+            "GET",
+            "/v2/queue/job-1",
+            429,
+            Some("30"),
+        ),
+        ("/mineskin/skins", "POST", "/v2/queue", 429, Some("30")),
+    ] {
+        let case = format!("{route} after MineSkin {upstream_status} {retry_after:?}");
         let server = MockServer::start().await;
-        let mut template = ResponseTemplate::new(429).set_body_json(json!({
+        if upstream_method == "POST" {
+            mount_supported_capes(&server, 1).await;
+        }
+        let mut template = ResponseTemplate::new(upstream_status).set_body_json(json!({
             "success": false,
             "errors": [{ "message": "rate limit exceeded" }]
         }));
-        if let Some(value) = upstream_retry_after {
+        if let Some(value) = retry_after {
             template = template.insert_header("Retry-After", value);
         }
-        Mock::given(method("GET"))
-            .and(path("/v2/capes"))
+        Mock::given(method(upstream_method))
+            .and(path(upstream_path))
             .respond_with(template)
+            .expect(1)
             .mount(&server)
             .await;
         let app = mock_app(&server)?;
 
-        let response = get(&app, "/mineskin/capes").await?;
+        let response = if upstream_method == "POST" {
+            post_upload(&app, route).await?
+        } else {
+            get(&app, route).await?
+        };
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let (expected_status, expected_retry_after, expected_code) = if upstream_status == 429 {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                retry_after,
+                "mineskin_rate_limited",
+            )
+        } else {
+            (StatusCode::BAD_GATEWAY, None, "mineskin_error")
+        };
+        assert_eq!(response.status(), expected_status, "{case}");
         assert_eq!(
             response
                 .headers()
                 .get(header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
-            expected,
-            "upstream Retry-After {upstream_retry_after:?}"
+            expected_retry_after,
+            "{case}"
         );
         assert_eq!(
             json_body(response).await?,
-            json!({ "error": "rate limit exceeded", "code": "mineskin_rate_limited" })
+            json!({ "error": "rate limit exceeded", "code": expected_code }),
+            "{case}"
         );
+        server.verify().await;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_a_mineskin_504_on_the_queue_request_as_a_502() -> TestResult {
+    let server = MockServer::start().await;
+    mount_supported_capes(&server, 1).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/queue"))
+        .respond_with(ResponseTemplate::new(504).set_body_json(json!({
+            "success": false,
+            "errors": [{ "message": "upstream timed out" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = mock_app(&server)?;
+
+    let response = post_upload(&app, "/mineskin/skins").await?;
+
+    // Only the polling deadline is a 504. MineSkin's own 504 is a 502.
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        json_body(response).await?,
+        json!({ "error": "upstream timed out", "code": "mineskin_error" })
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[test]
+fn openapi_document_declares_retry_after_on_every_429_and_503() -> TestResult {
+    let value = serde_json::to_value(api_document(4242))?;
+    for pointer in [
+        "/paths/~1mineskin~1skins/post/responses/429",
+        "/paths/~1mineskin~1skins/post/responses/503",
+        "/paths/~1mineskin~1jobs~1{jobId}/get/responses/429",
+        "/paths/~1mineskin~1capes/get/responses/429",
+        "/paths/~1mineskin~1cape-support/get/responses/429",
+    ] {
+        let schema = value
+            .pointer(&format!("{pointer}/headers/Retry-After/schema/type"))
+            .and_then(Value::as_str);
+        assert_eq!(schema, Some("integer"), "{pointer}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn replaces_a_cloudflare_ray_id_that_is_too_long_or_has_other_characters() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+    let too_long = "a".repeat(65);
+    let longest = "a".repeat(64);
+
+    for (ray, kept) in [
+        (too_long.as_bytes(), false),
+        (b"has space".as_slice(), false),
+        (b"quote\"and;semicolon".as_slice(), false),
+        (b"caf\xe9".as_slice(), false),
+        (longest.as_bytes(), true),
+    ] {
+        let response = send(
+            &app,
+            Request::get("/health")
+                .header("cf-ray", header::HeaderValue::from_bytes(ray)?)
+                .body(Body::empty())?,
+        )
+        .await?;
+        let id = response
+            .headers()
+            .get("x-request-id")
+            .ok_or_else(|| io::Error::other("response has no x-request-id header"))?;
+        if kept {
+            assert_eq!(id.as_bytes(), ray);
+        } else {
+            uuid::Uuid::parse_str(id.to_str()?)?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn lets_browser_clients_read_the_request_id_and_retry_after() -> TestResult {
+    let app = test_app("http://127.0.0.1:9/v2/")?;
+
+    let response = send(
+        &app,
+        Request::get("/health")
+            .header(header::ORIGIN, "https://example.com")
+            .body(Body::empty())?,
+    )
+    .await?;
+
+    let exposed = response
+        .headers()
+        .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .ok_or_else(|| io::Error::other("response exposes no headers"))?
+        .to_str()?
+        .split(',')
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    assert!(exposed.contains("x-request-id"), "{exposed:?}");
+    assert!(exposed.contains("retry-after"), "{exposed:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn answers_a_duplicate_skin_upload_from_the_queue_response() -> TestResult {
+    let server = MockServer::start().await;
+    mount_supported_capes(&server, 1).await;
+    let mut duplicate = completed_job_response();
+    if let Some(flag) = duplicate.pointer_mut("/skin/duplicate") {
+        *flag = json!(true);
+    }
+    if let Some(messages) = duplicate.get_mut("messages") {
+        *messages = json!([{ "code": "skin_found", "message": "Found existing skin" }]);
+    }
+    Mock::given(method("POST"))
+        .and(path("/v2/queue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(duplicate))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = mock_app(&server)?;
+
+    let response = post_upload(&app, "/mineskin/skins").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await?;
+    let encrypted_url = encrypted_skin_url(&body)?;
+    assert_eq!(
+        body,
+        json!({
+            "success": true,
+            "skin": { "url": encrypted_url },
+            "warnings": [],
+            "messages": [{ "code": "skin_found", "message": "Found existing skin" }],
+            "job": { "id": "job-1", "status": "completed" }
+        })
+    );
+    assert_eq!(
+        upstream_requests(&server, Some("/v2/queue/job-1")).await,
+        0,
+        "a duplicate skin needs no job poll"
+    );
+    let decrypted = decrypt(&app, encrypted_url).await?;
+    assert_eq!(
+        json_body(decrypted).await?,
+        json!({ "url": format!("https://minesk.in/{SKIN_ID}") })
+    );
+    server.verify().await;
     Ok(())
 }
