@@ -1,7 +1,13 @@
 name: Build and test
 
 on:
+  # Other branches are checked through their pull request, so same-repo PRs
+  # don't run twice. Renovate automerges branches without a PR, so its
+  # branches keep a push trigger.
   push:
+    branches:
+      - main
+      - "renovate/**"
   pull_request:
 
 permissions:
