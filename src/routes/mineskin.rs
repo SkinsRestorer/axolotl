@@ -124,11 +124,11 @@ Defaults to 1000.",
         (status = 400, description = "A form field or `waitMs` is invalid, the cape is not supported, or MineSkin rejected the skin. Codes: `invalid_wait_ms`, `invalid_upload`, `unsupported_cape`.", body = ErrorResponse),
         (status = 408, description = "The upload body was not received in time. Code: `upload_body_timeout`.", body = ErrorResponse),
         (status = 413, description = "The skin file or the upload body exceeds the size limit. Code: `payload_too_large`.", body = ErrorResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse, headers(("Retry-After" = u64, description = "Seconds to wait before retrying. Sent when MineSkin sent one."))),
         (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error or an unreadable response, or the job failed. Code: `mineskin_error`.", body = ErrorResponse),
-        (status = 503, description = "Too many uploads are in progress. Retry later. Code: `upload_busy`.", body = ErrorResponse),
-        (status = 504, description = "MineSkin did not finish the job in time (code `job_timeout`), or the upload exceeded its execution deadline (code `upload_timeout`).", body = ErrorResponse)
+        (status = 503, description = "Too many uploads are in progress. Code: `upload_busy`. Retry after the number of seconds in `Retry-After`.", body = ErrorResponse, headers(("Retry-After" = u64, description = "Seconds to wait before retrying."))),
+        (status = 504, description = "MineSkin did not finish the job in time (code `job_timeout`), the upload exceeded its execution deadline (code `upload_timeout`), or MineSkin answered the cape list or queue request with a 504 (code `mineskin_error`).", body = ErrorResponse)
     )
 )]
 pub async fn upload_skin(
@@ -175,11 +175,12 @@ pub async fn upload_skin(
         .enqueue(upload)
         .await
         .map_err(map_enqueue_error)?;
+    let job_id = job.id.clone();
     let response = state
         .mineskin
         .poll_job(job, poll_interval)
         .await
-        .map_err(map_upload_error)?;
+        .map_err(|error| map_poll_error(error).with_job_id(job_id))?;
 
     Ok(Json(response))
 }
@@ -202,7 +203,7 @@ pub async fn upload_skin(
         (status = 200, description = "The job exists. `skin` is null until the job completes, then `skin.url` is the encrypted skin URL.", body = SanitizedResponse),
         (status = 400, description = "The job ID is invalid. Code: `invalid_job_id`.", body = ErrorResponse),
         (status = 404, description = "MineSkin has no job with this ID. Code: `job_not_found`.", body = ErrorResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse, headers(("Retry-After" = u64, description = "Seconds to wait before retrying. Sent when MineSkin sent one."))),
         (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error or an unreadable response, or the job failed. Code: `mineskin_error`.", body = ErrorResponse)
     )
@@ -235,7 +236,7 @@ pub async fn job_status(
 `capeUuid` when uploading. The list is cached, and a stale list is served while MineSkin fails.",
     responses(
         (status = 200, description = "The supported capes.", body = CapesResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse, headers(("Retry-After" = u64, description = "Seconds to wait before retrying. Sent when MineSkin sent one."))),
         (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error or an unreadable response. Code: `mineskin_error`.", body = ErrorResponse)
     )
@@ -256,12 +257,12 @@ pub async fn supported_capes(
     get,
     path = "/mineskin/cape-support",
     tag = "mineskin",
-    summary = "Check whether the configured MineSkin account has cape grants and list supported capes.",
+    summary = "Check whether the configured MineSkin account has a cape grant and list supported capes.",
     description = "`capes` is empty when `hasCapeGrant` is false. Otherwise it matches \
 `GET /mineskin/capes`.",
     responses(
         (status = 200, description = "Whether the account may use capes, and the supported capes.", body = CapeSupportResponse),
-        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse),
+        (status = 429, description = "The proxy's MineSkin account is rate limited. Code: `mineskin_rate_limited`. `Retry-After` gives the wait in seconds when MineSkin sent one.", body = ErrorResponse, headers(("Retry-After" = u64, description = "Seconds to wait before retrying. Sent when MineSkin sent one."))),
         (status = 500, description = "The proxy has no usable MineSkin API key or AES secret key. Code: `not_configured`.", body = ErrorResponse),
         (status = 502, description = "MineSkin returned an error or an unreadable response. Code: `mineskin_error`.", body = ErrorResponse)
     )
@@ -296,7 +297,7 @@ pub async fn cape_support(
     get,
     path = "/mineskin/decrypt-url",
     tag = "mineskin",
-    summary = "Decrypt an encrypted MineSkin URL back to the original URL.",
+    summary = "Decrypt an encrypted skin URL into a https://minesk.in/<id> URL.",
     params(
         (
             "encryptedUrl" = String,
@@ -490,7 +491,13 @@ fn map_enqueue_error(error: MineSkinClientError) -> ApiError {
     let is_client_error = matches!(error, MineSkinClientError::InvalidUpload(_))
         || error.upstream_status() == Some(StatusCode::BAD_REQUEST);
     if is_client_error {
-        return mineskin_error(error, StatusCode::BAD_REQUEST);
+        let rejected_by_mineskin = error.upstream_status() == Some(StatusCode::BAD_REQUEST);
+        let api_error = mineskin_error(error, StatusCode::BAD_REQUEST);
+        return if rejected_by_mineskin {
+            api_error.with_code(ErrorCode::SkinRejected)
+        } else {
+            api_error
+        };
     }
 
     map_upload_error(error)
@@ -505,8 +512,10 @@ fn map_upload_error(error: MineSkinClientError) -> ApiError {
     } else {
         match &error {
             MineSkinClientError::Configuration(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // Only the polling deadline is a 504 (see map_poll_error). Any other
+            // upstream failure, including MineSkin's own 504, is a 502.
             MineSkinClientError::Upstream { status, .. } => match *status {
-                StatusCode::TOO_MANY_REQUESTS | StatusCode::GATEWAY_TIMEOUT => *status,
+                StatusCode::TOO_MANY_REQUESTS => *status,
                 _ => StatusCode::BAD_GATEWAY,
             },
             MineSkinClientError::Request(_)
@@ -517,6 +526,15 @@ fn map_upload_error(error: MineSkinClientError) -> ApiError {
     };
 
     mineskin_error(error, status)
+}
+
+/// Maps job poll errors. The poll retries `MineSkin`'s own 504s, so a 504 here
+/// means that the job did not finish before the polling deadline.
+fn map_poll_error(error: MineSkinClientError) -> ApiError {
+    if error.upstream_status() == Some(StatusCode::GATEWAY_TIMEOUT) {
+        return mineskin_error(error, StatusCode::GATEWAY_TIMEOUT).with_code(ErrorCode::JobTimeout);
+    }
+    map_upload_error(error)
 }
 
 fn map_job_error(error: MineSkinClientError) -> ApiError {
@@ -561,7 +579,6 @@ fn mineskin_error(error: MineSkinClientError, status: StatusCode) -> ApiError {
         StatusCode::BAD_REQUEST => ErrorCode::InvalidUpload,
         StatusCode::NOT_FOUND => ErrorCode::JobNotFound,
         StatusCode::TOO_MANY_REQUESTS => ErrorCode::MineskinRateLimited,
-        StatusCode::GATEWAY_TIMEOUT => ErrorCode::JobTimeout,
         StatusCode::INTERNAL_SERVER_ERROR => ErrorCode::NotConfigured,
         _ => ErrorCode::MineskinError,
     };

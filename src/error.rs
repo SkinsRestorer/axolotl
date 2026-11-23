@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use utoipa::ToSchema;
 
 /// Stable, machine-readable error code. Clients should branch on this value
@@ -16,9 +16,11 @@ use utoipa::ToSchema;
 pub enum ErrorCode {
     /// `waitMs` is not an integer between 250 and 10000.
     InvalidWaitMs,
-    /// The upload form is malformed, a field is missing or invalid, or `MineSkin`
-    /// rejected the skin.
+    /// The upload form is malformed, or a field is missing or invalid.
     InvalidUpload,
+    /// `MineSkin` rejected the skin, for example because the image is not a
+    /// valid skin.
+    SkinRejected,
     /// The requested cape is not in `GET /mineskin/capes`.
     UnsupportedCape,
     /// The job ID has a wrong length or contains other characters.
@@ -88,6 +90,7 @@ pub struct ApiError {
     code: ErrorCode,
     message: String,
     retry_after: Option<Duration>,
+    job_id: Option<String>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -101,6 +104,7 @@ impl ApiError {
             code: ErrorCode::for_status(status),
             message: message.into(),
             retry_after: None,
+            job_id: None,
             source: None,
         }
     }
@@ -115,6 +119,14 @@ impl ApiError {
     #[must_use]
     pub const fn with_retry_after(mut self, delay: Duration) -> Self {
         self.retry_after = Some(delay);
+        self
+    }
+
+    /// Names the `MineSkin` job that the failed request had already queued, so
+    /// the client can check it later instead of uploading again.
+    #[must_use]
+    pub fn with_job_id(mut self, job_id: impl Into<String>) -> Self {
+        self.job_id = Some(job_id.into());
         self
     }
 
@@ -144,7 +156,9 @@ impl IntoResponse for ApiError {
             .source
             .as_deref()
             .map(|source| source as &dyn std::error::Error);
-        if self.status.is_server_error() {
+        if self.code == ErrorCode::UploadBusy {
+            warn!(status, message = %self.message, "Request rejected");
+        } else if self.status.is_server_error() {
             // Upstream failures are also logged where they happen, with their own
             // context. This line records the response that the client receives.
             error!(status, message = %self.message, error = source, "Request failed");
@@ -157,6 +171,7 @@ impl IntoResponse for ApiError {
             Json(ErrorResponse {
                 error: self.message,
                 code: self.code,
+                job_id: self.job_id,
             }),
         )
             .into_response();
@@ -185,6 +200,12 @@ pub struct ErrorResponse {
     pub error: String,
     /// Machine-readable error code.
     pub code: ErrorCode,
+    /// The `MineSkin` job that an upload had already queued before it failed,
+    /// for example on `job_timeout`. Pass it to `GET /mineskin/jobs/{jobId}`
+    /// instead of uploading again. Absent when no job was queued.
+    #[serde(rename = "jobId", skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub job_id: Option<String>,
 }
 
 #[cfg(test)]
